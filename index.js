@@ -100,7 +100,7 @@ app.delete('/api/services/:id', asyncHandler(async (req, res) => {
 
 // ─── MASTERS ─────────────────────────────────────────────────────────────────
 
-function rowToMaster(r, serviceIds = []) {
+function rowToMaster(r, serviceIds = [], disabledVariantIds = []) {
   return {
     id: r.id,
     name: r.name,
@@ -108,18 +108,32 @@ function rowToMaster(r, serviceIds = []) {
     experience: r.experience,
     photo: r.photo_url,
     services: serviceIds,
+    disabledVariantIds,
   }
+}
+
+async function saveDisabledVariants(masterId, disabledVariantIds) {
+  await query('DELETE FROM master_disabled_variants WHERE master_id = $1', [masterId])
+  if (!disabledVariantIds?.length) return
+  const values = disabledVariantIds.map((_, i) => `($1, $${i + 2})`).join(',')
+  await query(`INSERT INTO master_disabled_variants (master_id, variant_id) VALUES ${values}`, [masterId, ...disabledVariantIds])
 }
 
 app.get('/api/masters', asyncHandler(async (req, res) => {
   const masters = await query('SELECT * FROM masters WHERE active = true ORDER BY sort_order')
   const links = await query('SELECT master_id, service_id FROM master_services')
+  const disabled = await query('SELECT master_id, variant_id FROM master_disabled_variants')
   const byMaster = {}
   for (const l of links) {
     if (!byMaster[l.master_id]) byMaster[l.master_id] = []
     byMaster[l.master_id].push(l.service_id)
   }
-  res.json(masters.map(m => rowToMaster(m, byMaster[m.id] ?? [])))
+  const disabledByMaster = {}
+  for (const d of disabled) {
+    if (!disabledByMaster[d.master_id]) disabledByMaster[d.master_id] = []
+    disabledByMaster[d.master_id].push(d.variant_id)
+  }
+  res.json(masters.map(m => rowToMaster(m, byMaster[m.id] ?? [], disabledByMaster[m.id] ?? [])))
 }))
 
 app.post('/api/masters', asyncHandler(async (req, res) => {
@@ -133,7 +147,8 @@ app.post('/api/masters', asyncHandler(async (req, res) => {
     const values = serviceIds.map((_, i) => `($1, $${i + 2})`).join(',')
     await query(`INSERT INTO master_services (master_id, service_id) VALUES ${values}`, [created.id, ...serviceIds])
   }
-  res.json(rowToMaster(created, serviceIds ?? []))
+  await saveDisabledVariants(created.id, m.disabledVariantIds)
+  res.json(rowToMaster(created, serviceIds ?? [], m.disabledVariantIds ?? []))
 }))
 
 app.put('/api/masters/:id', asyncHandler(async (req, res) => {
@@ -148,6 +163,7 @@ app.put('/api/masters/:id', asyncHandler(async (req, res) => {
     const values = serviceIds.map((_, i) => `($1, $${i + 2})`).join(',')
     await query(`INSERT INTO master_services (master_id, service_id) VALUES ${values}`, [id, ...serviceIds])
   }
+  await saveDisabledVariants(id, m.disabledVariantIds)
   res.json({ ok: true })
 }))
 
