@@ -1,0 +1,412 @@
+import express from 'express'
+import cors from 'cors'
+import { pool, query } from './db.js'
+
+const app = express()
+app.use(cors())
+app.use(express.json())
+
+const PORT = process.env.PORT || 8787
+
+// ─── helpers ────────────────────────────────────────────────────────────────
+
+function toMinutes(t) {
+  const [h, m] = t.split(':').map(Number)
+  return h * 60 + (m ?? 0)
+}
+function minutesToTime(m) {
+  return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`
+}
+function asyncHandler(fn) {
+  return (req, res, next) => fn(req, res, next).catch(next)
+}
+
+// ─── SERVICES ────────────────────────────────────────────────────────────────
+
+function rowToService(r) {
+  return {
+    id: r.id,
+    name: r.name,
+    description: r.description,
+    priceFrom: r.price_from,
+    duration: r.duration,
+    durationMinutes: r.duration_minutes ?? 60,
+    active: r.active,
+    sortOrder: r.sort_order ?? 0,
+  }
+}
+
+app.get('/api/services', asyncHandler(async (req, res) => {
+  const rows = await query('SELECT * FROM services WHERE active = true ORDER BY sort_order')
+  res.json(rows.map(rowToService))
+}))
+
+app.post('/api/services', asyncHandler(async (req, res) => {
+  const s = req.body
+  const rows = await query(
+    `INSERT INTO services (name, description, price_from, duration, duration_minutes, active, sort_order)
+     VALUES ($1,$2,$3,$4,$5,true,$6) RETURNING *`,
+    [s.name, s.description, s.priceFrom, s.duration, s.durationMinutes ?? 60, s.sortOrder ?? 0],
+  )
+  res.json(rowToService(rows[0]))
+}))
+
+app.put('/api/services/:id', asyncHandler(async (req, res) => {
+  const s = req.body
+  await query(
+    `UPDATE services SET name=$1, description=$2, price_from=$3, duration=$4, duration_minutes=$5 WHERE id=$6`,
+    [s.name, s.description, s.priceFrom, s.duration, s.durationMinutes ?? 60, req.params.id],
+  )
+  res.json({ ok: true })
+}))
+
+app.delete('/api/services/:id', asyncHandler(async (req, res) => {
+  await query('UPDATE services SET active = false WHERE id = $1', [req.params.id])
+  res.json({ ok: true })
+}))
+
+// ─── MASTERS ─────────────────────────────────────────────────────────────────
+
+function rowToMaster(r, serviceIds = []) {
+  return {
+    id: r.id,
+    name: r.name,
+    role: r.role,
+    experience: r.experience,
+    photo: r.photo_url,
+    services: serviceIds,
+  }
+}
+
+app.get('/api/masters', asyncHandler(async (req, res) => {
+  const masters = await query('SELECT * FROM masters WHERE active = true ORDER BY sort_order')
+  const links = await query('SELECT master_id, service_id FROM master_services')
+  const byMaster = {}
+  for (const l of links) {
+    if (!byMaster[l.master_id]) byMaster[l.master_id] = []
+    byMaster[l.master_id].push(l.service_id)
+  }
+  res.json(masters.map(m => rowToMaster(m, byMaster[m.id] ?? [])))
+}))
+
+app.post('/api/masters', asyncHandler(async (req, res) => {
+  const { master: m, serviceIds } = req.body
+  const rows = await query(
+    `INSERT INTO masters (name, role, experience, photo_url, active) VALUES ($1,$2,$3,$4,true) RETURNING *`,
+    [m.name, m.role, m.experience, m.photo],
+  )
+  const created = rows[0]
+  if (serviceIds?.length) {
+    const values = serviceIds.map((_, i) => `($1, $${i + 2})`).join(',')
+    await query(`INSERT INTO master_services (master_id, service_id) VALUES ${values}`, [created.id, ...serviceIds])
+  }
+  res.json(rowToMaster(created, serviceIds ?? []))
+}))
+
+app.put('/api/masters/:id', asyncHandler(async (req, res) => {
+  const { master: m, serviceIds } = req.body
+  const id = req.params.id
+  await query(
+    `UPDATE masters SET name=$1, role=$2, experience=$3, photo_url=$4 WHERE id=$5`,
+    [m.name, m.role, m.experience, m.photo, id],
+  )
+  await query('DELETE FROM master_services WHERE master_id = $1', [id])
+  if (serviceIds?.length) {
+    const values = serviceIds.map((_, i) => `($1, $${i + 2})`).join(',')
+    await query(`INSERT INTO master_services (master_id, service_id) VALUES ${values}`, [id, ...serviceIds])
+  }
+  res.json({ ok: true })
+}))
+
+app.delete('/api/masters/:id', asyncHandler(async (req, res) => {
+  await query('UPDATE masters SET active = false WHERE id = $1', [req.params.id])
+  res.json({ ok: true })
+}))
+
+// ─── SCHEDULE ────────────────────────────────────────────────────────────────
+
+app.get('/api/masters/:id/schedule', asyncHandler(async (req, res) => {
+  const rows = await query('SELECT * FROM master_schedule WHERE master_id = $1 ORDER BY day_of_week', [req.params.id])
+  res.json(rows.map(r => ({
+    dayOfWeek: r.day_of_week,
+    startTime: r.start_time.slice(0, 5),
+    endTime: r.end_time.slice(0, 5),
+    active: r.active,
+  })))
+}))
+
+app.put('/api/masters/:id/schedule', asyncHandler(async (req, res) => {
+  const id = req.params.id
+  const days = req.body.days ?? []
+  await query('DELETE FROM master_schedule WHERE master_id = $1', [id])
+  const active = days.filter(d => d.active)
+  for (const d of active) {
+    await query(
+      `INSERT INTO master_schedule (master_id, day_of_week, start_time, end_time, active) VALUES ($1,$2,$3,$4,true)`,
+      [id, d.dayOfWeek, d.startTime, d.endTime],
+    )
+  }
+  res.json({ ok: true })
+}))
+
+// ─── DAYS OFF ────────────────────────────────────────────────────────────────
+
+app.get('/api/masters/:id/days-off', asyncHandler(async (req, res) => {
+  const rows = await query('SELECT * FROM master_days_off WHERE master_id = $1 ORDER BY date', [req.params.id])
+  res.json(rows.map(r => ({ id: r.id, date: r.date, reason: r.reason })))
+}))
+
+app.post('/api/masters/:id/days-off', asyncHandler(async (req, res) => {
+  const { date, reason = '' } = req.body
+  const rows = await query(
+    `INSERT INTO master_days_off (master_id, date, reason) VALUES ($1,$2,$3) RETURNING *`,
+    [req.params.id, date, reason],
+  )
+  res.json({ id: rows[0].id, date: rows[0].date, reason: rows[0].reason })
+}))
+
+app.delete('/api/days-off/:id', asyncHandler(async (req, res) => {
+  await query('DELETE FROM master_days_off WHERE id = $1', [req.params.id])
+  res.json({ ok: true })
+}))
+
+// ─── SERVICE DAYS ────────────────────────────────────────────────────────────
+
+app.get('/api/masters/:id/service-days', asyncHandler(async (req, res) => {
+  const rows = await query('SELECT service_id, day_of_week FROM master_service_days WHERE master_id = $1', [req.params.id])
+  const result = {}
+  for (const r of rows) {
+    if (!result[r.service_id]) result[r.service_id] = []
+    result[r.service_id].push(r.day_of_week)
+  }
+  res.json(result)
+}))
+
+app.put('/api/masters/:id/service-days/:serviceId', asyncHandler(async (req, res) => {
+  const { id, serviceId } = req.params
+  const days = req.body.days ?? []
+  await query('DELETE FROM master_service_days WHERE master_id = $1 AND service_id = $2', [id, serviceId])
+  for (const dow of days) {
+    await query(
+      `INSERT INTO master_service_days (master_id, service_id, day_of_week) VALUES ($1,$2,$3)`,
+      [id, serviceId, dow],
+    )
+  }
+  res.json({ ok: true })
+}))
+
+// ─── BOOKINGS ────────────────────────────────────────────────────────────────
+
+function rowToBooking(r) {
+  return {
+    id: r.id,
+    createdAt: r.created_at,
+    service: r.service_name,
+    serviceId: r.service_id,
+    master: r.master_name ?? null,
+    masterId: r.master_id ?? null,
+    date: r.date,
+    time: r.time.slice(0, 5),
+    name: r.client_name,
+    phone: r.client_phone,
+    comment: r.comment,
+    status: r.status,
+    source: r.source ?? 'website',
+  }
+}
+
+app.get('/api/bookings', asyncHandler(async (req, res) => {
+  const rows = await query('SELECT * FROM bookings ORDER BY created_at DESC')
+  res.json(rows.map(rowToBooking))
+}))
+
+app.post('/api/bookings', asyncHandler(async (req, res) => {
+  const b = req.body
+  const rows = await query(
+    `INSERT INTO bookings (service_id, service_name, master_id, master_name, date, time, duration_minutes, client_name, client_phone, comment, status, source)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'new',$11) RETURNING *`,
+    [b.serviceId ?? null, b.service, b.masterId ?? null, b.master ?? '', b.date, b.time, 60, b.name, b.phone, b.comment ?? '', b.source ?? 'website'],
+  )
+  res.json(rowToBooking(rows[0]))
+}))
+
+app.patch('/api/bookings/:id/status', asyncHandler(async (req, res) => {
+  await query('UPDATE bookings SET status = $1 WHERE id = $2', [req.body.status, req.params.id])
+  res.json({ ok: true })
+}))
+
+// ─── CONTENT ─────────────────────────────────────────────────────────────────
+
+app.get('/api/content', asyncHandler(async (req, res) => {
+  const rows = await query('SELECT * FROM site_content')
+  const map = {}
+  rows.forEach(r => { map[r.key] = r.value })
+  res.json(map)
+}))
+
+app.put('/api/content', asyncHandler(async (req, res) => {
+  const c = req.body
+  for (const [key, value] of Object.entries(c)) {
+    await query(
+      `INSERT INTO site_content (key, value, updated_at) VALUES ($1,$2,NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [key, value ?? ''],
+    )
+  }
+  res.json({ ok: true })
+}))
+
+// ─── VACANCIES ───────────────────────────────────────────────────────────────
+
+function rowToVacancy(r) {
+  return { id: r.id, title: r.title, description: r.description, requirements: r.requirements }
+}
+
+app.get('/api/vacancies', asyncHandler(async (req, res) => {
+  const rows = await query('SELECT * FROM vacancies WHERE active = true ORDER BY sort_order')
+  res.json(rows.map(rowToVacancy))
+}))
+
+app.post('/api/vacancies', asyncHandler(async (req, res) => {
+  const v = req.body
+  const rows = await query(
+    `INSERT INTO vacancies (title, description, requirements, active, sort_order) VALUES ($1,$2,$3,true,0) RETURNING *`,
+    [v.title, v.description, v.requirements],
+  )
+  res.json(rowToVacancy(rows[0]))
+}))
+
+app.put('/api/vacancies/:id', asyncHandler(async (req, res) => {
+  const v = req.body
+  await query('UPDATE vacancies SET title=$1, description=$2, requirements=$3 WHERE id=$4', [v.title, v.description, v.requirements, req.params.id])
+  res.json({ ok: true })
+}))
+
+app.delete('/api/vacancies/:id', asyncHandler(async (req, res) => {
+  await query('UPDATE vacancies SET active = false WHERE id = $1', [req.params.id])
+  res.json({ ok: true })
+}))
+
+// ─── AVAILABILITY ─────────────────────────────────────────────────────────────
+
+async function resolveMasterIds(masterId, serviceId) {
+  if (masterId) return [masterId]
+  const rows = await query('SELECT master_id FROM master_services WHERE service_id = $1', [serviceId])
+  return rows.map(r => r.master_id)
+}
+
+app.get('/api/availability/days', asyncHandler(async (req, res) => {
+  const { masterId, serviceId, year, month } = req.query
+  const y = Number(year), mo = Number(month)
+  const masterIds = await resolveMasterIds(masterId || null, serviceId)
+  if (!masterIds.length) return res.json([])
+
+  const startDate = `${y}-${String(mo + 1).padStart(2, '0')}-01`
+  const endDate = `${y}-${String(mo + 1).padStart(2, '0')}-31`
+
+  const [schedules, daysOff, serviceDaysRows] = await Promise.all([
+    query('SELECT master_id, day_of_week FROM master_schedule WHERE master_id = ANY($1) AND active = true', [masterIds]),
+    query('SELECT master_id, date FROM master_days_off WHERE master_id = ANY($1) AND date >= $2 AND date <= $3', [masterIds, startDate, endDate]),
+    query('SELECT master_id, day_of_week FROM master_service_days WHERE master_id = ANY($1) AND service_id = $2', [masterIds, serviceId]),
+  ])
+
+  const serviceDayMap = {}
+  serviceDaysRows.forEach(r => {
+    if (!serviceDayMap[r.master_id]) serviceDayMap[r.master_id] = new Set()
+    serviceDayMap[r.master_id].add(r.day_of_week)
+  })
+  const offMap = {}
+  daysOff.forEach(d => {
+    const key = d.master_id
+    if (!offMap[key]) offMap[key] = new Set()
+    offMap[key].add(d.date)
+  })
+
+  const today = new Date(); today.setHours(0, 0, 0, 0)
+  const daysInMonth = new Date(y, mo + 1, 0).getDate()
+  const result = []
+
+  for (let d = 1; d <= daysInMonth; d++) {
+    const date = new Date(y, mo, d)
+    if (date < today) continue
+    const dow = date.getDay() === 0 ? 6 : date.getDay() - 1
+    const dateStr = `${y}-${String(mo + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+
+    const anyAvail = masterIds.some(mid => {
+      const works = schedules.some(s => s.master_id === mid && s.day_of_week === dow)
+      const isOff = offMap[mid]?.has(dateStr) ?? false
+      const svcDays = serviceDayMap[mid]
+      const serviceAllowed = !svcDays || svcDays.size === 0 || svcDays.has(dow)
+      return works && !isOff && serviceAllowed
+    })
+    if (anyAvail) result.push(d)
+  }
+  res.json(result)
+}))
+
+app.get('/api/availability/slots', asyncHandler(async (req, res) => {
+  const { masterId, serviceId, date, durationMinutes } = req.query
+  const durationMin = Number(durationMinutes) || 60
+  const dateObj = new Date(date)
+  const dow = dateObj.getDay() === 0 ? 6 : dateObj.getDay() - 1
+  const masterIds = await resolveMasterIds(masterId || null, serviceId)
+  if (!masterIds.length) return res.json([])
+
+  const [schedules, existingBookings, serviceDaysRows] = await Promise.all([
+    query('SELECT master_id, start_time, end_time FROM master_schedule WHERE master_id = ANY($1) AND day_of_week = $2 AND active = true', [masterIds, dow]),
+    query("SELECT master_id, time, duration_minutes FROM bookings WHERE master_id = ANY($1) AND date = $2 AND status != 'cancelled'", [masterIds, date]),
+    query('SELECT master_id, day_of_week FROM master_service_days WHERE master_id = ANY($1) AND service_id = $2', [masterIds, serviceId]),
+  ])
+
+  const serviceDayMap = {}
+  serviceDaysRows.forEach(r => {
+    if (!serviceDayMap[r.master_id]) serviceDayMap[r.master_id] = new Set()
+    serviceDayMap[r.master_id].add(r.day_of_week)
+  })
+  const filteredSchedules = schedules.filter(sched => {
+    const svcDays = serviceDayMap[sched.master_id]
+    return !svcDays || svcDays.size === 0 || svcDays.has(dow)
+  })
+
+  const slotMap = {}
+  for (const sched of filteredSchedules) {
+    const startMin = toMinutes(sched.start_time.slice(0, 5))
+    const endMin = toMinutes(sched.end_time.slice(0, 5))
+    const masterBookings = existingBookings.filter(b => b.master_id === sched.master_id)
+
+    for (let t = startMin; t + durationMin <= endMin; t += 30) {
+      const slotKey = minutesToTime(t)
+      if (slotMap[slotKey] === true) continue
+      const blocked = masterBookings.some(b => {
+        const bs = toMinutes(b.time.slice(0, 5))
+        const be = bs + (b.duration_minutes ?? 60)
+        return t < be && t + durationMin > bs
+      })
+      if (!blocked) slotMap[slotKey] = true
+      else if (slotMap[slotKey] === undefined) slotMap[slotKey] = false
+    }
+  }
+
+  const result = Object.entries(slotMap)
+    .sort(([a], [b]) => toMinutes(a) - toMinutes(b))
+    .map(([time, available]) => ({ time, available }))
+  res.json(result)
+}))
+
+// ─── HEALTH ──────────────────────────────────────────────────────────────────
+
+app.get('/api/health', asyncHandler(async (req, res) => {
+  await query('SELECT 1')
+  res.json({ ok: true })
+}))
+
+app.use((err, req, res, _next) => {
+  console.error(err)
+  res.status(500).json({ error: err.message ?? String(err) })
+})
+
+app.listen(PORT, () => {
+  console.log(`API server listening on http://localhost:${PORT}`)
+})
+
+process.on('SIGTERM', () => pool.end())
