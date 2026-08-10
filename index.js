@@ -23,7 +23,7 @@ function asyncHandler(fn) {
 
 // ─── SERVICES ────────────────────────────────────────────────────────────────
 
-function rowToService(r) {
+function rowToService(r, variants = []) {
   return {
     id: r.id,
     name: r.name,
@@ -33,12 +33,41 @@ function rowToService(r) {
     durationMinutes: r.duration_minutes ?? 60,
     active: r.active,
     sortOrder: r.sort_order ?? 0,
+    variants: variants.map(v => ({
+      id: v.id,
+      name: v.name,
+      priceFrom: v.price_from ?? undefined,
+      durationMinutes: v.duration_minutes ?? undefined,
+    })),
+  }
+}
+
+async function saveVariants(serviceId, variants) {
+  await query('DELETE FROM service_variants WHERE service_id = $1', [serviceId])
+  if (!variants?.length) return
+  for (let i = 0; i < variants.length; i++) {
+    const v = variants[i]
+    if (!v.name?.trim()) continue
+    await query(
+      `INSERT INTO service_variants (service_id, name, price_from, duration_minutes, sort_order)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [serviceId, v.name.trim(), v.priceFrom ?? null, v.durationMinutes ?? null, i],
+    )
   }
 }
 
 app.get('/api/services', asyncHandler(async (req, res) => {
   const rows = await query('SELECT * FROM services WHERE active = true ORDER BY sort_order')
-  res.json(rows.map(rowToService))
+  const variantRows = await query(
+    'SELECT * FROM service_variants WHERE service_id = ANY($1) ORDER BY sort_order',
+    [rows.map(r => r.id)],
+  )
+  const byService = {}
+  for (const v of variantRows) {
+    if (!byService[v.service_id]) byService[v.service_id] = []
+    byService[v.service_id].push(v)
+  }
+  res.json(rows.map(r => rowToService(r, byService[r.id] ?? [])))
 }))
 
 app.post('/api/services', asyncHandler(async (req, res) => {
@@ -48,7 +77,10 @@ app.post('/api/services', asyncHandler(async (req, res) => {
      VALUES ($1,$2,$3,$4,$5,true,$6) RETURNING *`,
     [s.name, s.description, s.priceFrom, s.duration, s.durationMinutes ?? 60, s.sortOrder ?? 0],
   )
-  res.json(rowToService(rows[0]))
+  const created = rows[0]
+  await saveVariants(created.id, s.variants)
+  const variantRows = await query('SELECT * FROM service_variants WHERE service_id = $1 ORDER BY sort_order', [created.id])
+  res.json(rowToService(created, variantRows))
 }))
 
 app.put('/api/services/:id', asyncHandler(async (req, res) => {
@@ -57,6 +89,7 @@ app.put('/api/services/:id', asyncHandler(async (req, res) => {
     `UPDATE services SET name=$1, description=$2, price_from=$3, duration=$4, duration_minutes=$5 WHERE id=$6`,
     [s.name, s.description, s.priceFrom, s.duration, s.durationMinutes ?? 60, req.params.id],
   )
+  await saveVariants(req.params.id, s.variants)
   res.json({ ok: true })
 }))
 
@@ -203,6 +236,7 @@ function rowToBooking(r) {
     createdAt: r.created_at,
     service: r.service_name,
     serviceId: r.service_id,
+    variantName: r.variant_name || null,
     master: r.master_name ?? null,
     masterId: r.master_id ?? null,
     date: r.date,
@@ -223,9 +257,9 @@ app.get('/api/bookings', asyncHandler(async (req, res) => {
 app.post('/api/bookings', asyncHandler(async (req, res) => {
   const b = req.body
   const rows = await query(
-    `INSERT INTO bookings (service_id, service_name, master_id, master_name, date, time, duration_minutes, client_name, client_phone, comment, status, source)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'new',$11) RETURNING *`,
-    [b.serviceId ?? null, b.service, b.masterId ?? null, b.master ?? '', b.date, b.time, 60, b.name, b.phone, b.comment ?? '', b.source ?? 'website'],
+    `INSERT INTO bookings (service_id, service_name, variant_name, master_id, master_name, date, time, duration_minutes, client_name, client_phone, comment, status, source)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'new',$12) RETURNING *`,
+    [b.serviceId ?? null, b.service, b.variantName ?? '', b.masterId ?? null, b.master ?? '', b.date, b.time, 60, b.name, b.phone, b.comment ?? '', b.source ?? 'website'],
   )
   res.json(rowToBooking(rows[0]))
 }))
