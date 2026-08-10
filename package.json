@@ -8,7 +8,9 @@
     "node": ">=18"
   },
   "scripts": {
-    "start": "node index.js"
+    "build": "echo 'no build step needed'",
+    "start": "node index.js",
+    "start:prod": "node index.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
