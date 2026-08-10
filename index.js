@@ -244,6 +244,31 @@ app.put('/api/masters/:id/service-days/:serviceId', asyncHandler(async (req, res
   res.json({ ok: true })
 }))
 
+// ─── VARIANT DAYS (per-variant day restrictions) ────────────────────────────
+
+app.get('/api/masters/:id/variant-days', asyncHandler(async (req, res) => {
+  const rows = await query('SELECT variant_id, day_of_week FROM master_variant_days WHERE master_id = $1', [req.params.id])
+  const result = {}
+  for (const r of rows) {
+    if (!result[r.variant_id]) result[r.variant_id] = []
+    result[r.variant_id].push(r.day_of_week)
+  }
+  res.json(result)
+}))
+
+app.put('/api/masters/:id/variant-days/:variantId', asyncHandler(async (req, res) => {
+  const { id, variantId } = req.params
+  const days = req.body.days ?? []
+  await query('DELETE FROM master_variant_days WHERE master_id = $1 AND variant_id = $2', [id, variantId])
+  for (const dow of days) {
+    await query(
+      `INSERT INTO master_variant_days (master_id, variant_id, day_of_week) VALUES ($1,$2,$3)`,
+      [id, variantId, dow],
+    )
+  }
+  res.json({ ok: true })
+}))
+
 // ─── BOOKINGS ────────────────────────────────────────────────────────────────
 
 function rowToBooking(r) {
@@ -351,7 +376,7 @@ async function resolveMasterIds(masterId, serviceId) {
 }
 
 app.get('/api/availability/days', asyncHandler(async (req, res) => {
-  const { masterId, serviceId, year, month } = req.query
+  const { masterId, serviceId, variantId, year, month } = req.query
   const y = Number(year), mo = Number(month)
   const masterIds = await resolveMasterIds(masterId || null, serviceId)
   if (!masterIds.length) return res.json([])
@@ -359,16 +384,24 @@ app.get('/api/availability/days', asyncHandler(async (req, res) => {
   const startDate = `${y}-${String(mo + 1).padStart(2, '0')}-01`
   const endDate = `${y}-${String(mo + 1).padStart(2, '0')}-31`
 
-  const [schedules, daysOff, serviceDaysRows] = await Promise.all([
+  const [schedules, daysOff, serviceDaysRows, variantDaysRows] = await Promise.all([
     query('SELECT master_id, day_of_week FROM master_schedule WHERE master_id = ANY($1) AND active = true', [masterIds]),
     query('SELECT master_id, date FROM master_days_off WHERE master_id = ANY($1) AND date >= $2 AND date <= $3', [masterIds, startDate, endDate]),
     query('SELECT master_id, day_of_week FROM master_service_days WHERE master_id = ANY($1) AND service_id = $2', [masterIds, serviceId]),
+    variantId
+      ? query('SELECT master_id, day_of_week FROM master_variant_days WHERE master_id = ANY($1) AND variant_id = $2', [masterIds, variantId])
+      : Promise.resolve([]),
   ])
 
   const serviceDayMap = {}
   serviceDaysRows.forEach(r => {
     if (!serviceDayMap[r.master_id]) serviceDayMap[r.master_id] = new Set()
     serviceDayMap[r.master_id].add(r.day_of_week)
+  })
+  const variantDayMap = {}
+  variantDaysRows.forEach(r => {
+    if (!variantDayMap[r.master_id]) variantDayMap[r.master_id] = new Set()
+    variantDayMap[r.master_id].add(r.day_of_week)
   })
   const offMap = {}
   daysOff.forEach(d => {
@@ -392,7 +425,9 @@ app.get('/api/availability/days', asyncHandler(async (req, res) => {
       const isOff = offMap[mid]?.has(dateStr) ?? false
       const svcDays = serviceDayMap[mid]
       const serviceAllowed = !svcDays || svcDays.size === 0 || svcDays.has(dow)
-      return works && !isOff && serviceAllowed
+      const varDays = variantDayMap[mid]
+      const variantAllowed = !varDays || varDays.size === 0 || varDays.has(dow)
+      return works && !isOff && serviceAllowed && variantAllowed
     })
     if (anyAvail) result.push(d)
   }
@@ -400,17 +435,20 @@ app.get('/api/availability/days', asyncHandler(async (req, res) => {
 }))
 
 app.get('/api/availability/slots', asyncHandler(async (req, res) => {
-  const { masterId, serviceId, date, durationMinutes } = req.query
+  const { masterId, serviceId, variantId, date, durationMinutes } = req.query
   const durationMin = Number(durationMinutes) || 60
   const dateObj = new Date(date)
   const dow = dateObj.getDay() === 0 ? 6 : dateObj.getDay() - 1
   const masterIds = await resolveMasterIds(masterId || null, serviceId)
   if (!masterIds.length) return res.json([])
 
-  const [schedules, existingBookings, serviceDaysRows] = await Promise.all([
+  const [schedules, existingBookings, serviceDaysRows, variantDaysRows] = await Promise.all([
     query('SELECT master_id, start_time, end_time FROM master_schedule WHERE master_id = ANY($1) AND day_of_week = $2 AND active = true', [masterIds, dow]),
     query("SELECT master_id, time, duration_minutes FROM bookings WHERE master_id = ANY($1) AND date = $2 AND status != 'cancelled'", [masterIds, date]),
     query('SELECT master_id, day_of_week FROM master_service_days WHERE master_id = ANY($1) AND service_id = $2', [masterIds, serviceId]),
+    variantId
+      ? query('SELECT master_id, day_of_week FROM master_variant_days WHERE master_id = ANY($1) AND variant_id = $2', [masterIds, variantId])
+      : Promise.resolve([]),
   ])
 
   const serviceDayMap = {}
@@ -418,9 +456,17 @@ app.get('/api/availability/slots', asyncHandler(async (req, res) => {
     if (!serviceDayMap[r.master_id]) serviceDayMap[r.master_id] = new Set()
     serviceDayMap[r.master_id].add(r.day_of_week)
   })
+  const variantDayMap = {}
+  variantDaysRows.forEach(r => {
+    if (!variantDayMap[r.master_id]) variantDayMap[r.master_id] = new Set()
+    variantDayMap[r.master_id].add(r.day_of_week)
+  })
   const filteredSchedules = schedules.filter(sched => {
     const svcDays = serviceDayMap[sched.master_id]
-    return !svcDays || svcDays.size === 0 || svcDays.has(dow)
+    const serviceAllowed = !svcDays || svcDays.size === 0 || svcDays.has(dow)
+    const varDays = variantDayMap[sched.master_id]
+    const variantAllowed = !varDays || varDays.size === 0 || varDays.has(dow)
+    return serviceAllowed && variantAllowed
   })
 
   const slotMap = {}
