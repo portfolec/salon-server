@@ -235,6 +235,11 @@ app.patch('/api/bookings/:id/status', asyncHandler(async (req, res) => {
   res.json({ ok: true })
 }))
 
+app.delete('/api/bookings/:id', asyncHandler(async (req, res) => {
+  await query('DELETE FROM bookings WHERE id = $1', [req.params.id])
+  res.status(204).end()
+}))
+
 // ─── CONTENT ─────────────────────────────────────────────────────────────────
 
 app.get('/api/content', asyncHandler(async (req, res) => {
