@@ -1,12 +1,49 @@
 import express from 'express'
 import cors from 'cors'
+import multer from 'multer'
+import path from 'path'
+import fs from 'fs'
+import crypto from 'crypto'
+import { fileURLToPath } from 'url'
 import { pool, query } from './db.js'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const UPLOADS_DIR = path.join(__dirname, 'uploads')
+fs.mkdirSync(UPLOADS_DIR, { recursive: true })
 
 const app = express()
 app.use(cors())
 app.use(express.json())
+app.use('/uploads', express.static(UPLOADS_DIR))
 
 const PORT = process.env.PORT || 8787
+
+// ─── FILE UPLOADS (master photos etc.) ──────────────────────────────────────
+
+const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif'])
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname).toLowerCase() || '.jpg'
+      cb(null, `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`)
+    },
+  }),
+  limits: { fileSize: 8 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (!ALLOWED_IMAGE_TYPES.has(file.mimetype)) return cb(new Error('Недопустимый тип файла'))
+    cb(null, true)
+  },
+})
+
+app.post('/api/upload', (req, res) => {
+  upload.single('photo')(req, res, (err) => {
+    if (err) return res.status(400).json({ error: err.message })
+    if (!req.file) return res.status(400).json({ error: 'Файл не получен' })
+    res.json({ url: `/uploads/${req.file.filename}` })
+  })
+})
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
