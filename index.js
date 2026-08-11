@@ -8,6 +8,11 @@ import crypto from 'crypto'
 import { fileURLToPath } from 'url'
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
 import { pool, query } from './db.js'
+import {
+  hashPassword, verifyPassword, toPublicUser,
+  createSession, deleteSession, getSessionUser,
+  requireAuth, requirePermission, requireOwner,
+} from './auth.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -87,7 +92,7 @@ const upload = multer({
   },
 })
 
-app.post('/api/upload', (req, res) => {
+app.post('/api/upload', requireAuth, (req, res) => {
   if (!s3Configured && !UPLOADS_DIR) {
     return res.status(503).json({ error: 'Загрузка файлов недоступна на сервере' })
   }
@@ -114,6 +119,120 @@ app.post('/api/upload', (req, res) => {
     }
   })
 })
+
+// `asyncHandler` is a function declaration further down this file — hoisted,
+// so it's already callable up here.
+
+// ─── AUTH ────────────────────────────────────────────────────────────────────
+
+app.post('/api/auth/login', asyncHandler(async (req, res) => {
+  const { username, password } = req.body ?? {}
+  if (!username || !password) return res.status(400).json({ error: 'Введите логин и пароль' })
+
+  const rows = await query('SELECT * FROM admin_users WHERE username = $1', [username])
+  const user = rows[0]
+  if (!user || !user.active || !verifyPassword(password, user.password_hash)) {
+    return res.status(401).json({ error: 'Неверный логин или пароль' })
+  }
+  const token = await createSession(user.id)
+  res.json({ token, user: toPublicUser(user) })
+}))
+
+app.post('/api/auth/logout', requireAuth, asyncHandler(async (req, res) => {
+  await deleteSession(req.adminToken)
+  res.json({ ok: true })
+}))
+
+app.get('/api/auth/me', requireAuth, asyncHandler(async (req, res) => {
+  res.json({ user: toPublicUser(req.adminUser) })
+}))
+
+// ─── ADMIN USERS (owner-only staff account management) ─────────────────────
+
+app.get('/api/admin-users', requireOwner, asyncHandler(async (req, res) => {
+  const rows = await query('SELECT * FROM admin_users ORDER BY created_at')
+  res.json(rows.map(toPublicUser))
+}))
+
+app.post('/api/admin-users', requireOwner, asyncHandler(async (req, res) => {
+  const { username, password, role, permissions = {} } = req.body ?? {}
+  if (!username?.trim() || !password) return res.status(400).json({ error: 'Логин и пароль обязательны' })
+  if (password.length < 6) return res.status(400).json({ error: 'Пароль должен быть не короче 6 символов' })
+
+  const existing = await query('SELECT id FROM admin_users WHERE username = $1', [username.trim()])
+  if (existing.length) return res.status(409).json({ error: 'Такой логин уже существует' })
+
+  const finalRole = role === 'owner' ? 'owner' : 'staff'
+  const rows = await query(
+    `INSERT INTO admin_users
+       (username, password_hash, role, can_bookings, can_masters, can_schedule, can_services, can_vacancies, can_content, can_notifications, active)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true) RETURNING *`,
+    [
+      username.trim(), hashPassword(password), finalRole,
+      !!permissions.bookings, !!permissions.masters, !!permissions.schedule,
+      !!permissions.services, !!permissions.vacancies, !!permissions.content, !!permissions.notifications,
+    ],
+  )
+  res.json(toPublicUser(rows[0]))
+}))
+
+app.put('/api/admin-users/:id', requireOwner, asyncHandler(async (req, res) => {
+  const { id } = req.params
+  const { password, role, permissions, active } = req.body ?? {}
+
+  if (id === req.adminUser.id && active === false) {
+    return res.status(400).json({ error: 'Нельзя отключить собственный аккаунт' })
+  }
+  if (id === req.adminUser.id && role && role !== 'owner') {
+    return res.status(400).json({ error: 'Нельзя понизить собственные права' })
+  }
+
+  const finalRole = role === 'owner' ? 'owner' : role === 'staff' ? 'staff' : undefined
+  const perm = permissions ?? {}
+  await query(
+    `UPDATE admin_users SET
+       role = COALESCE($1, role),
+       active = COALESCE($2, active),
+       can_bookings = COALESCE($3, can_bookings),
+       can_masters = COALESCE($4, can_masters),
+       can_schedule = COALESCE($5, can_schedule),
+       can_services = COALESCE($6, can_services),
+       can_vacancies = COALESCE($7, can_vacancies),
+       can_content = COALESCE($8, can_content),
+       can_notifications = COALESCE($9, can_notifications)
+     WHERE id = $10`,
+    [
+      finalRole, typeof active === 'boolean' ? active : null,
+      permissions ? !!perm.bookings : null,
+      permissions ? !!perm.masters : null,
+      permissions ? !!perm.schedule : null,
+      permissions ? !!perm.services : null,
+      permissions ? !!perm.vacancies : null,
+      permissions ? !!perm.content : null,
+      permissions ? !!perm.notifications : null,
+      id,
+    ],
+  )
+  if (password) {
+    if (password.length < 6) return res.status(400).json({ error: 'Пароль должен быть не короче 6 символов' })
+    await query('UPDATE admin_users SET password_hash = $1 WHERE id = $2', [hashPassword(password), id])
+  }
+  const rows = await query('SELECT * FROM admin_users WHERE id = $1', [id])
+  if (!rows.length) return res.status(404).json({ error: 'Пользователь не найден' })
+  res.json(toPublicUser(rows[0]))
+}))
+
+app.delete('/api/admin-users/:id', requireOwner, asyncHandler(async (req, res) => {
+  const { id } = req.params
+  if (id === req.adminUser.id) return res.status(400).json({ error: 'Нельзя удалить собственный аккаунт' })
+  const owners = await query("SELECT count(*)::int AS n FROM admin_users WHERE role = 'owner' AND active = true")
+  const target = await query('SELECT role FROM admin_users WHERE id = $1', [id])
+  if (target[0]?.role === 'owner' && owners[0].n <= 1) {
+    return res.status(400).json({ error: 'Должен остаться хотя бы один владелец' })
+  }
+  await query('DELETE FROM admin_users WHERE id = $1', [id])
+  res.status(204).end()
+}))
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -177,7 +296,7 @@ app.get('/api/services', asyncHandler(async (req, res) => {
   res.json(rows.map(r => rowToService(r, byService[r.id] ?? [])))
 }))
 
-app.post('/api/services', asyncHandler(async (req, res) => {
+app.post('/api/services', ...requirePermission('services'), asyncHandler(async (req, res) => {
   const s = req.body
   const rows = await query(
     `INSERT INTO services (name, description, price_from, duration, duration_minutes, active, sort_order)
@@ -190,7 +309,7 @@ app.post('/api/services', asyncHandler(async (req, res) => {
   res.json(rowToService(created, variantRows))
 }))
 
-app.put('/api/services/:id', asyncHandler(async (req, res) => {
+app.put('/api/services/:id', ...requirePermission('services'), asyncHandler(async (req, res) => {
   const s = req.body
   await query(
     `UPDATE services SET name=$1, description=$2, price_from=$3, duration=$4, duration_minutes=$5 WHERE id=$6`,
@@ -200,7 +319,7 @@ app.put('/api/services/:id', asyncHandler(async (req, res) => {
   res.json({ ok: true })
 }))
 
-app.delete('/api/services/:id', asyncHandler(async (req, res) => {
+app.delete('/api/services/:id', ...requirePermission('services'), asyncHandler(async (req, res) => {
   await query('UPDATE services SET active = false WHERE id = $1', [req.params.id])
   res.json({ ok: true })
 }))
@@ -243,7 +362,7 @@ app.get('/api/masters', asyncHandler(async (req, res) => {
   res.json(masters.map(m => rowToMaster(m, byMaster[m.id] ?? [], disabledByMaster[m.id] ?? [])))
 }))
 
-app.post('/api/masters', asyncHandler(async (req, res) => {
+app.post('/api/masters', ...requirePermission('masters'), asyncHandler(async (req, res) => {
   const { master: m, serviceIds } = req.body
   const rows = await query(
     `INSERT INTO masters (name, role, experience, photo_url, active) VALUES ($1,$2,$3,$4,true) RETURNING *`,
@@ -258,7 +377,7 @@ app.post('/api/masters', asyncHandler(async (req, res) => {
   res.json(rowToMaster(created, serviceIds ?? [], m.disabledVariantIds ?? []))
 }))
 
-app.put('/api/masters/:id', asyncHandler(async (req, res) => {
+app.put('/api/masters/:id', ...requirePermission('masters'), asyncHandler(async (req, res) => {
   const { master: m, serviceIds } = req.body
   const id = req.params.id
   await query(
@@ -274,14 +393,14 @@ app.put('/api/masters/:id', asyncHandler(async (req, res) => {
   res.json({ ok: true })
 }))
 
-app.delete('/api/masters/:id', asyncHandler(async (req, res) => {
+app.delete('/api/masters/:id', ...requirePermission('masters'), asyncHandler(async (req, res) => {
   await query('UPDATE masters SET active = false WHERE id = $1', [req.params.id])
   res.json({ ok: true })
 }))
 
 // ─── SCHEDULE ────────────────────────────────────────────────────────────────
 
-app.get('/api/masters/:id/schedule', asyncHandler(async (req, res) => {
+app.get('/api/masters/:id/schedule', ...requirePermission('schedule'), asyncHandler(async (req, res) => {
   const rows = await query('SELECT * FROM master_schedule WHERE master_id = $1 ORDER BY day_of_week', [req.params.id])
   res.json(rows.map(r => ({
     dayOfWeek: r.day_of_week,
@@ -291,7 +410,7 @@ app.get('/api/masters/:id/schedule', asyncHandler(async (req, res) => {
   })))
 }))
 
-app.put('/api/masters/:id/schedule', asyncHandler(async (req, res) => {
+app.put('/api/masters/:id/schedule', ...requirePermission('schedule'), asyncHandler(async (req, res) => {
   const id = req.params.id
   const days = req.body.days ?? []
   await query('DELETE FROM master_schedule WHERE master_id = $1', [id])
@@ -307,12 +426,12 @@ app.put('/api/masters/:id/schedule', asyncHandler(async (req, res) => {
 
 // ─── DAYS OFF ────────────────────────────────────────────────────────────────
 
-app.get('/api/masters/:id/days-off', asyncHandler(async (req, res) => {
+app.get('/api/masters/:id/days-off', ...requirePermission('schedule'), asyncHandler(async (req, res) => {
   const rows = await query('SELECT * FROM master_days_off WHERE master_id = $1 ORDER BY date', [req.params.id])
   res.json(rows.map(r => ({ id: r.id, date: r.date, reason: r.reason })))
 }))
 
-app.post('/api/masters/:id/days-off', asyncHandler(async (req, res) => {
+app.post('/api/masters/:id/days-off', ...requirePermission('schedule'), asyncHandler(async (req, res) => {
   const { date, reason = '' } = req.body
   const rows = await query(
     `INSERT INTO master_days_off (master_id, date, reason) VALUES ($1,$2,$3) RETURNING *`,
@@ -321,14 +440,14 @@ app.post('/api/masters/:id/days-off', asyncHandler(async (req, res) => {
   res.json({ id: rows[0].id, date: rows[0].date, reason: rows[0].reason })
 }))
 
-app.delete('/api/days-off/:id', asyncHandler(async (req, res) => {
+app.delete('/api/days-off/:id', ...requirePermission('schedule'), asyncHandler(async (req, res) => {
   await query('DELETE FROM master_days_off WHERE id = $1', [req.params.id])
   res.json({ ok: true })
 }))
 
 // ─── SERVICE DAYS ────────────────────────────────────────────────────────────
 
-app.get('/api/masters/:id/service-days', asyncHandler(async (req, res) => {
+app.get('/api/masters/:id/service-days', ...requirePermission('schedule'), asyncHandler(async (req, res) => {
   const rows = await query('SELECT service_id, day_of_week FROM master_service_days WHERE master_id = $1', [req.params.id])
   const result = {}
   for (const r of rows) {
@@ -338,7 +457,7 @@ app.get('/api/masters/:id/service-days', asyncHandler(async (req, res) => {
   res.json(result)
 }))
 
-app.put('/api/masters/:id/service-days/:serviceId', asyncHandler(async (req, res) => {
+app.put('/api/masters/:id/service-days/:serviceId', ...requirePermission('schedule'), asyncHandler(async (req, res) => {
   const { id, serviceId } = req.params
   const days = req.body.days ?? []
   await query('DELETE FROM master_service_days WHERE master_id = $1 AND service_id = $2', [id, serviceId])
@@ -353,7 +472,7 @@ app.put('/api/masters/:id/service-days/:serviceId', asyncHandler(async (req, res
 
 // ─── VARIANT DAYS (per-variant day restrictions) ────────────────────────────
 
-app.get('/api/masters/:id/variant-days', asyncHandler(async (req, res) => {
+app.get('/api/masters/:id/variant-days', ...requirePermission('schedule'), asyncHandler(async (req, res) => {
   const rows = await query('SELECT variant_id, day_of_week FROM master_variant_days WHERE master_id = $1', [req.params.id])
   const result = {}
   for (const r of rows) {
@@ -363,7 +482,7 @@ app.get('/api/masters/:id/variant-days', asyncHandler(async (req, res) => {
   res.json(result)
 }))
 
-app.put('/api/masters/:id/variant-days/:variantId', asyncHandler(async (req, res) => {
+app.put('/api/masters/:id/variant-days/:variantId', ...requirePermission('schedule'), asyncHandler(async (req, res) => {
   const { id, variantId } = req.params
   const days = req.body.days ?? []
   await query('DELETE FROM master_variant_days WHERE master_id = $1 AND variant_id = $2', [id, variantId])
@@ -397,7 +516,7 @@ function rowToBooking(r) {
   }
 }
 
-app.get('/api/bookings', asyncHandler(async (req, res) => {
+app.get('/api/bookings', ...requirePermission('bookings'), asyncHandler(async (req, res) => {
   const rows = await query('SELECT * FROM bookings ORDER BY created_at DESC')
   res.json(rows.map(rowToBooking))
 }))
@@ -412,12 +531,12 @@ app.post('/api/bookings', asyncHandler(async (req, res) => {
   res.json(rowToBooking(rows[0]))
 }))
 
-app.patch('/api/bookings/:id/status', asyncHandler(async (req, res) => {
+app.patch('/api/bookings/:id/status', ...requirePermission('bookings'), asyncHandler(async (req, res) => {
   await query('UPDATE bookings SET status = $1 WHERE id = $2', [req.body.status, req.params.id])
   res.json({ ok: true })
 }))
 
-app.delete('/api/bookings/:id', asyncHandler(async (req, res) => {
+app.delete('/api/bookings/:id', ...requirePermission('bookings'), asyncHandler(async (req, res) => {
   await query('DELETE FROM bookings WHERE id = $1', [req.params.id])
   res.status(204).end()
 }))
@@ -431,7 +550,7 @@ app.get('/api/content', asyncHandler(async (req, res) => {
   res.json(map)
 }))
 
-app.put('/api/content', asyncHandler(async (req, res) => {
+app.put('/api/content', ...requirePermission('content', 'notifications'), asyncHandler(async (req, res) => {
   const c = req.body
   for (const [key, value] of Object.entries(c)) {
     await query(
@@ -454,7 +573,7 @@ app.get('/api/vacancies', asyncHandler(async (req, res) => {
   res.json(rows.map(rowToVacancy))
 }))
 
-app.post('/api/vacancies', asyncHandler(async (req, res) => {
+app.post('/api/vacancies', ...requirePermission('vacancies'), asyncHandler(async (req, res) => {
   const v = req.body
   const rows = await query(
     `INSERT INTO vacancies (title, description, requirements, active, sort_order) VALUES ($1,$2,$3,true,0) RETURNING *`,
@@ -463,13 +582,13 @@ app.post('/api/vacancies', asyncHandler(async (req, res) => {
   res.json(rowToVacancy(rows[0]))
 }))
 
-app.put('/api/vacancies/:id', asyncHandler(async (req, res) => {
+app.put('/api/vacancies/:id', ...requirePermission('vacancies'), asyncHandler(async (req, res) => {
   const v = req.body
   await query('UPDATE vacancies SET title=$1, description=$2, requirements=$3 WHERE id=$4', [v.title, v.description, v.requirements, req.params.id])
   res.json({ ok: true })
 }))
 
-app.delete('/api/vacancies/:id', asyncHandler(async (req, res) => {
+app.delete('/api/vacancies/:id', ...requirePermission('vacancies'), asyncHandler(async (req, res) => {
   await query('UPDATE vacancies SET active = false WHERE id = $1', [req.params.id])
   res.json({ ok: true })
 }))
