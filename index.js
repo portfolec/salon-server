@@ -3,18 +3,43 @@ import cors from 'cors'
 import multer from 'multer'
 import path from 'path'
 import fs from 'fs'
+import os from 'os'
 import crypto from 'crypto'
 import { fileURLToPath } from 'url'
 import { pool, query } from './db.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const UPLOADS_DIR = path.join(__dirname, 'uploads')
-fs.mkdirSync(UPLOADS_DIR, { recursive: true })
+
+// Some hosting platforms (e.g. Timeweb App Platform) run the app from a read-only
+// directory as a non-root user, so writing next to the source code can fail with
+// EACCES. Try a few candidate locations and fall back to the OS temp dir, which is
+// always writable (note: on most platforms it is NOT persisted across redeploys/restarts).
+function resolveUploadsDir() {
+  const candidates = [
+    process.env.UPLOADS_DIR,
+    path.join(__dirname, 'uploads'),
+    path.join(os.tmpdir(), 'salon-uploads'),
+  ].filter(Boolean)
+
+  for (const dir of candidates) {
+    try {
+      fs.mkdirSync(dir, { recursive: true })
+      fs.accessSync(dir, fs.constants.W_OK)
+      return dir
+    } catch {
+      // try next candidate
+    }
+  }
+  console.error('[uploads] No writable directory found, photo uploads will be disabled')
+  return null
+}
+
+const UPLOADS_DIR = resolveUploadsDir()
 
 const app = express()
 app.use(cors())
 app.use(express.json())
-app.use('/uploads', express.static(UPLOADS_DIR))
+if (UPLOADS_DIR) app.use('/uploads', express.static(UPLOADS_DIR))
 
 const PORT = process.env.PORT || 8787
 
@@ -38,6 +63,7 @@ const upload = multer({
 })
 
 app.post('/api/upload', (req, res) => {
+  if (!UPLOADS_DIR) return res.status(503).json({ error: 'Загрузка файлов недоступна на сервере' })
   upload.single('photo')(req, res, (err) => {
     if (err) return res.status(400).json({ error: err.message })
     if (!req.file) return res.status(400).json({ error: 'Файл не получен' })
