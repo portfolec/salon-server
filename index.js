@@ -6,14 +6,50 @@ import fs from 'fs'
 import os from 'os'
 import crypto from 'crypto'
 import { fileURLToPath } from 'url'
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
 import { pool, query } from './db.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-// Some hosting platforms (e.g. Timeweb App Platform) run the app from a read-only
-// directory as a non-root user, so writing next to the source code can fail with
-// EACCES. Try a few candidate locations and fall back to the OS temp dir, which is
-// always writable (note: on most platforms it is NOT persisted across redeploys/restarts).
+const app = express()
+app.use(cors())
+app.use(express.json())
+
+const PORT = process.env.PORT || 8787
+
+// ─── FILE UPLOADS (master photos etc.) ──────────────────────────────────────
+//
+// Preferred: Timeweb S3 object storage (persists across redeploys — App
+// Platform's own filesystem is ephemeral and often read-only for the app user).
+// Falls back to local disk for local development when S3 env vars aren't set.
+
+const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif'])
+const EXT_BY_MIME = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif', 'image/avif': '.avif' }
+
+const S3_ENDPOINT = process.env.S3_ENDPOINT || 'https://s3.twcstorage.ru'
+const S3_REGION = process.env.S3_REGION || 'ru-1'
+const S3_BUCKET = process.env.S3_BUCKET
+const S3_ACCESS_KEY = process.env.S3_ACCESS_KEY
+const S3_SECRET_KEY = process.env.S3_SECRET_KEY
+const s3Configured = !!(S3_BUCKET && S3_ACCESS_KEY && S3_SECRET_KEY)
+
+const s3Client = s3Configured
+  ? new S3Client({
+      region: S3_REGION,
+      endpoint: S3_ENDPOINT,
+      credentials: { accessKeyId: S3_ACCESS_KEY, secretAccessKey: S3_SECRET_KEY },
+    })
+  : null
+
+function makeFilename(originalname, mimetype) {
+  const ext = path.extname(originalname || '').toLowerCase() || EXT_BY_MIME[mimetype] || '.jpg'
+  return `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`
+}
+
+// Local-disk fallback dir (only used when S3 isn't configured).
+// Some hosting platforms run the app from a read-only directory as a non-root
+// user, so writing next to the source code can fail with EACCES — try a few
+// candidates and fall back to the OS temp dir (NOT persisted across restarts).
 function resolveUploadsDir() {
   const candidates = [
     process.env.UPLOADS_DIR,
@@ -34,27 +70,16 @@ function resolveUploadsDir() {
   return null
 }
 
-const UPLOADS_DIR = resolveUploadsDir()
-
-const app = express()
-app.use(cors())
-app.use(express.json())
+const UPLOADS_DIR = s3Configured ? null : resolveUploadsDir()
 if (UPLOADS_DIR) app.use('/uploads', express.static(UPLOADS_DIR))
 
-const PORT = process.env.PORT || 8787
-
-// ─── FILE UPLOADS (master photos etc.) ──────────────────────────────────────
-
-const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif'])
-
 const upload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
-    filename: (_req, file, cb) => {
-      const ext = path.extname(file.originalname).toLowerCase() || '.jpg'
-      cb(null, `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`)
-    },
-  }),
+  storage: s3Configured
+    ? multer.memoryStorage()
+    : multer.diskStorage({
+        destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
+        filename: (_req, file, cb) => cb(null, makeFilename(file.originalname, file.mimetype)),
+      }),
   limits: { fileSize: 8 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     if (!ALLOWED_IMAGE_TYPES.has(file.mimetype)) return cb(new Error('Недопустимый тип файла'))
@@ -63,11 +88,30 @@ const upload = multer({
 })
 
 app.post('/api/upload', (req, res) => {
-  if (!UPLOADS_DIR) return res.status(503).json({ error: 'Загрузка файлов недоступна на сервере' })
-  upload.single('photo')(req, res, (err) => {
+  if (!s3Configured && !UPLOADS_DIR) {
+    return res.status(503).json({ error: 'Загрузка файлов недоступна на сервере' })
+  }
+  upload.single('photo')(req, res, async (err) => {
     if (err) return res.status(400).json({ error: err.message })
     if (!req.file) return res.status(400).json({ error: 'Файл не получен' })
-    res.json({ url: `/uploads/${req.file.filename}` })
+
+    if (!s3Configured) {
+      return res.json({ url: `/uploads/${req.file.filename}` })
+    }
+
+    const key = makeFilename(req.file.originalname, req.file.mimetype)
+    try {
+      await s3Client.send(new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: key,
+        Body: req.file.buffer,
+        ContentType: req.file.mimetype,
+      }))
+      res.json({ url: `${S3_ENDPOINT}/${S3_BUCKET}/${key}` })
+    } catch (e) {
+      console.error('[uploads] S3 upload failed:', e)
+      res.status(502).json({ error: 'Не удалось загрузить файл в хранилище' })
+    }
   })
 })
 
