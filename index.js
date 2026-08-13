@@ -165,12 +165,13 @@ app.post('/api/admin-users', requireOwner, asyncHandler(async (req, res) => {
   const finalRole = role === 'owner' ? 'owner' : 'staff'
   const rows = await query(
     `INSERT INTO admin_users
-       (username, password_hash, role, can_bookings, can_masters, can_schedule, can_services, can_vacancies, can_content, can_notifications, active)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true) RETURNING *`,
+       (username, password_hash, role, can_bookings, can_masters, can_schedule, can_services, can_vacancies, can_testimonials, can_content, can_notifications, active)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true) RETURNING *`,
     [
       username.trim(), hashPassword(password), finalRole,
       !!permissions.bookings, !!permissions.masters, !!permissions.schedule,
-      !!permissions.services, !!permissions.vacancies, !!permissions.content, !!permissions.notifications,
+      !!permissions.services, !!permissions.vacancies, !!permissions.testimonials,
+      !!permissions.content, !!permissions.notifications,
     ],
   )
   res.json(toPublicUser(rows[0]))
@@ -198,9 +199,10 @@ app.put('/api/admin-users/:id', requireOwner, asyncHandler(async (req, res) => {
        can_schedule = COALESCE($5, can_schedule),
        can_services = COALESCE($6, can_services),
        can_vacancies = COALESCE($7, can_vacancies),
-       can_content = COALESCE($8, can_content),
-       can_notifications = COALESCE($9, can_notifications)
-     WHERE id = $10`,
+       can_testimonials = COALESCE($8, can_testimonials),
+       can_content = COALESCE($9, can_content),
+       can_notifications = COALESCE($10, can_notifications)
+     WHERE id = $11`,
     [
       finalRole, typeof active === 'boolean' ? active : null,
       permissions ? !!perm.bookings : null,
@@ -208,6 +210,7 @@ app.put('/api/admin-users/:id', requireOwner, asyncHandler(async (req, res) => {
       permissions ? !!perm.schedule : null,
       permissions ? !!perm.services : null,
       permissions ? !!perm.vacancies : null,
+      permissions ? !!perm.testimonials : null,
       permissions ? !!perm.content : null,
       permissions ? !!perm.notifications : null,
       id,
@@ -590,6 +593,37 @@ app.put('/api/vacancies/:id', ...requirePermission('vacancies'), asyncHandler(as
 
 app.delete('/api/vacancies/:id', ...requirePermission('vacancies'), asyncHandler(async (req, res) => {
   await query('UPDATE vacancies SET active = false WHERE id = $1', [req.params.id])
+  res.json({ ok: true })
+}))
+
+// ─── TESTIMONIALS ────────────────────────────────────────────────────────────
+
+function rowToTestimonial(r) {
+  return { id: r.id, name: r.name, role: r.role, text: r.text }
+}
+
+app.get('/api/testimonials', asyncHandler(async (req, res) => {
+  const rows = await query('SELECT * FROM testimonials WHERE active = true ORDER BY sort_order')
+  res.json(rows.map(rowToTestimonial))
+}))
+
+app.post('/api/testimonials', ...requirePermission('testimonials'), asyncHandler(async (req, res) => {
+  const t = req.body
+  const rows = await query(
+    `INSERT INTO testimonials (name, role, text, active, sort_order) VALUES ($1,$2,$3,true,0) RETURNING *`,
+    [t.name, t.role, t.text],
+  )
+  res.json(rowToTestimonial(rows[0]))
+}))
+
+app.put('/api/testimonials/:id', ...requirePermission('testimonials'), asyncHandler(async (req, res) => {
+  const t = req.body
+  await query('UPDATE testimonials SET name=$1, role=$2, text=$3 WHERE id=$4', [t.name, t.role, t.text, req.params.id])
+  res.json({ ok: true })
+}))
+
+app.delete('/api/testimonials/:id', ...requirePermission('testimonials'), asyncHandler(async (req, res) => {
+  await query('UPDATE testimonials SET active = false WHERE id = $1', [req.params.id])
   res.json({ ok: true })
 }))
 

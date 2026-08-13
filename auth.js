@@ -19,6 +19,7 @@ export const PERMISSION_COLUMNS = {
   schedule: 'can_schedule',
   services: 'can_services',
   vacancies: 'can_vacancies',
+  testimonials: 'can_testimonials',
   content: 'can_content',
   notifications: 'can_notifications',
 }
