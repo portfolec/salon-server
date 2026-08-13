@@ -30,6 +30,7 @@ export function toPublicUser(row) {
     id: row.id,
     username: row.username,
     role: row.role,
+    masterId: row.master_id ?? null,
     active: row.active,
     createdAt: row.created_at,
     permissions: Object.fromEntries(
@@ -110,6 +111,17 @@ export const requireOwner = [
   requireAuth,
   (req, res, next) => {
     if (req.adminUser.role !== 'owner') return res.status(403).json({ error: 'Требуются права владельца' })
+    next()
+  },
+]
+
+/** Requires an authenticated 'master' account linked to a master profile (personal cabinet). */
+export const requireMaster = [
+  requireAuth,
+  (req, res, next) => {
+    if (req.adminUser.role !== 'master' || !req.adminUser.master_id) {
+      return res.status(403).json({ error: 'Доступно только для аккаунтов мастеров' })
+    }
     next()
   },
 ]

@@ -11,7 +11,7 @@ import { pool, query } from './db.js'
 import {
   hashPassword, verifyPassword, toPublicUser,
   createSession, deleteSession, getSessionUser,
-  requireAuth, requirePermission, requireOwner, optionalAuth,
+  requireAuth, requirePermission, requireOwner, requireMaster, optionalAuth,
 } from './auth.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -155,23 +155,28 @@ app.get('/api/admin-users', requireOwner, asyncHandler(async (req, res) => {
 }))
 
 app.post('/api/admin-users', requireOwner, asyncHandler(async (req, res) => {
-  const { username, password, role, permissions = {} } = req.body ?? {}
+  const { username, password, role, permissions = {}, masterId } = req.body ?? {}
   if (!username?.trim() || !password) return res.status(400).json({ error: 'Логин и пароль обязательны' })
   if (password.length < 6) return res.status(400).json({ error: 'Пароль должен быть не короче 6 символов' })
 
   const existing = await query('SELECT id FROM admin_users WHERE username = $1', [username.trim()])
   if (existing.length) return res.status(409).json({ error: 'Такой логин уже существует' })
 
-  const finalRole = role === 'owner' ? 'owner' : 'staff'
+  const finalRole = role === 'owner' ? 'owner' : role === 'master' ? 'master' : 'staff'
+  if (finalRole === 'master' && !isUuid(masterId)) {
+    return res.status(400).json({ error: 'Выберите мастера для этого аккаунта' })
+  }
+  const isMaster = finalRole === 'master'
+
   const rows = await query(
     `INSERT INTO admin_users
-       (username, password_hash, role, can_bookings, can_masters, can_schedule, can_services, can_vacancies, can_testimonials, can_content, can_notifications, active)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true) RETURNING *`,
+       (username, password_hash, role, master_id, can_bookings, can_masters, can_schedule, can_services, can_vacancies, can_testimonials, can_content, can_notifications, active)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,true) RETURNING *`,
     [
-      username.trim(), hashPassword(password), finalRole,
-      !!permissions.bookings, !!permissions.masters, !!permissions.schedule,
-      !!permissions.services, !!permissions.vacancies, !!permissions.testimonials,
-      !!permissions.content, !!permissions.notifications,
+      username.trim(), hashPassword(password), finalRole, isMaster ? masterId : null,
+      !isMaster && !!permissions.bookings, !isMaster && !!permissions.masters, !isMaster && !!permissions.schedule,
+      !isMaster && !!permissions.services, !isMaster && !!permissions.vacancies, !isMaster && !!permissions.testimonials,
+      !isMaster && !!permissions.content, !isMaster && !!permissions.notifications,
     ],
   )
   res.json(toPublicUser(rows[0]))
@@ -179,7 +184,7 @@ app.post('/api/admin-users', requireOwner, asyncHandler(async (req, res) => {
 
 app.put('/api/admin-users/:id', requireOwner, asyncHandler(async (req, res) => {
   const { id } = req.params
-  const { password, role, permissions, active } = req.body ?? {}
+  const { password, role, permissions, active, masterId } = req.body ?? {}
 
   if (id === req.adminUser.id && active === false) {
     return res.status(400).json({ error: 'Нельзя отключить собственный аккаунт' })
@@ -188,20 +193,25 @@ app.put('/api/admin-users/:id', requireOwner, asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'Нельзя понизить собственные права' })
   }
 
-  const finalRole = role === 'owner' ? 'owner' : role === 'staff' ? 'staff' : undefined
+  const finalRole = role === 'owner' ? 'owner' : role === 'staff' ? 'staff' : role === 'master' ? 'master' : undefined
+  if (finalRole === 'master' && !isUuid(masterId)) {
+    return res.status(400).json({ error: 'Выберите мастера для этого аккаунта' })
+  }
+  const isMaster = finalRole === 'master'
   const perm = permissions ?? {}
   await query(
     `UPDATE admin_users SET
        role = COALESCE($1, role),
+       master_id = CASE WHEN $1 = 'master' THEN $12 WHEN $1 IN ('owner','staff') THEN NULL ELSE master_id END,
        active = COALESCE($2, active),
-       can_bookings = COALESCE($3, can_bookings),
-       can_masters = COALESCE($4, can_masters),
-       can_schedule = COALESCE($5, can_schedule),
-       can_services = COALESCE($6, can_services),
-       can_vacancies = COALESCE($7, can_vacancies),
-       can_testimonials = COALESCE($8, can_testimonials),
-       can_content = COALESCE($9, can_content),
-       can_notifications = COALESCE($10, can_notifications)
+       can_bookings = CASE WHEN $1 = 'master' THEN false ELSE COALESCE($3, can_bookings) END,
+       can_masters = CASE WHEN $1 = 'master' THEN false ELSE COALESCE($4, can_masters) END,
+       can_schedule = CASE WHEN $1 = 'master' THEN false ELSE COALESCE($5, can_schedule) END,
+       can_services = CASE WHEN $1 = 'master' THEN false ELSE COALESCE($6, can_services) END,
+       can_vacancies = CASE WHEN $1 = 'master' THEN false ELSE COALESCE($7, can_vacancies) END,
+       can_testimonials = CASE WHEN $1 = 'master' THEN false ELSE COALESCE($8, can_testimonials) END,
+       can_content = CASE WHEN $1 = 'master' THEN false ELSE COALESCE($9, can_content) END,
+       can_notifications = CASE WHEN $1 = 'master' THEN false ELSE COALESCE($10, can_notifications) END
      WHERE id = $11`,
     [
       finalRole, typeof active === 'boolean' ? active : null,
@@ -214,6 +224,7 @@ app.put('/api/admin-users/:id', requireOwner, asyncHandler(async (req, res) => {
       permissions ? !!perm.content : null,
       permissions ? !!perm.notifications : null,
       id,
+      isMaster ? masterId : null,
     ],
   )
   if (password) {
@@ -241,6 +252,17 @@ app.delete('/api/admin-users/:id', requireOwner, asyncHandler(async (req, res) =
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 function isUuid(v) { return typeof v === 'string' && UUID_RE.test(v) }
+
+/** Hides the middle of a phone number for master accounts (e.g. "+7 999 ••• •• 67"). */
+function maskPhone(phone) {
+  const digits = (phone ?? '').replace(/\D/g, '')
+  if (digits.length < 7) return '••••••'
+  const country = digits.slice(0, digits.length - 10)
+  const rest = digits.slice(-10)
+  const op = rest.slice(0, 3)
+  const last2 = rest.slice(-2)
+  return `+${country ? country + ' ' : ''}${op} ••• •• ${last2}`
+}
 
 function toMinutes(t) {
   const [h, m] = t.split(':').map(Number)
@@ -698,6 +720,34 @@ app.patch('/api/bookings/:id/master', ...requirePermission('bookings'), asyncHan
 app.delete('/api/bookings/:id', ...requirePermission('bookings'), asyncHandler(async (req, res) => {
   await query('DELETE FROM bookings WHERE id = $1', [req.params.id])
   res.status(204).end()
+}))
+
+// ─── MASTER PERSONAL CABINET (self-service, scoped to the caller's own master_id) ──
+
+app.get('/api/my/bookings', ...requireMaster, asyncHandler(async (req, res) => {
+  const rows = await query(
+    'SELECT * FROM bookings WHERE master_id = $1 ORDER BY date DESC, time DESC',
+    [req.adminUser.master_id],
+  )
+  res.json(rows.map(r => ({ ...rowToBooking(r), phone: maskPhone(r.client_phone) })))
+}))
+
+app.get('/api/my/schedule', ...requireMaster, asyncHandler(async (req, res) => {
+  const rows = await query('SELECT * FROM master_schedule WHERE master_id = $1 ORDER BY day_of_week', [req.adminUser.master_id])
+  res.json(rows.map(r => ({
+    dayOfWeek: r.day_of_week,
+    startTime: r.start_time.slice(0, 5),
+    endTime: r.end_time.slice(0, 5),
+    active: r.active,
+  })))
+}))
+
+app.get('/api/my/days-off', ...requireMaster, asyncHandler(async (req, res) => {
+  const rows = await query(
+    'SELECT * FROM master_days_off WHERE master_id = $1 AND date >= CURRENT_DATE ORDER BY date',
+    [req.adminUser.master_id],
+  )
+  res.json(rows.map(r => ({ id: r.id, date: r.date, reason: r.reason })))
 }))
 
 // ─── CONTENT ─────────────────────────────────────────────────────────────────
