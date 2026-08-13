@@ -11,7 +11,7 @@ import { pool, query } from './db.js'
 import {
   hashPassword, verifyPassword, toPublicUser,
   createSession, deleteSession, getSessionUser,
-  requireAuth, requirePermission, requireOwner,
+  requireAuth, requirePermission, requireOwner, optionalAuth,
 } from './auth.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -238,6 +238,9 @@ app.delete('/api/admin-users/:id', requireOwner, asyncHandler(async (req, res) =
 }))
 
 // ─── helpers ────────────────────────────────────────────────────────────────
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+function isUuid(v) { return typeof v === 'string' && UUID_RE.test(v) }
 
 function toMinutes(t) {
   const [h, m] = t.split(':').map(Number)
@@ -524,12 +527,134 @@ app.get('/api/bookings', ...requirePermission('bookings'), asyncHandler(async (r
   res.json(rows.map(rowToBooking))
 }))
 
-app.post('/api/bookings', asyncHandler(async (req, res) => {
+const VALID_BOOKING_STATUSES = ['new', 'confirmed', 'done', 'cancelled']
+
+/**
+ * Picks which specific master will actually take a booking, and makes sure they're
+ * really free at that date+time — this is what guarantees a "любой мастер" booking
+ * (or a race between two clients) never ends up with nobody actually available.
+ *
+ * Returns:
+ *   - { id, name } of the master to assign
+ *   - 'no_candidates' if the service has no masters configured at all (legacy/unassigned booking allowed)
+ *   - null if masters exist for the service but none of them is free for this exact slot
+ */
+async function resolveBookingMaster({ masterId, serviceId, variantId, date, time, durationMin }) {
+  const masterIds = masterId
+    ? [masterId]
+    : (await query(
+        `SELECT ms.master_id FROM master_services ms
+         JOIN masters m ON m.id = ms.master_id
+         WHERE ms.service_id = $1 AND m.active = true`,
+        [serviceId],
+      )).map(r => r.master_id)
+  if (!masterIds.length) return 'no_candidates'
+
+  const dateObj = new Date(date)
+  const dow = dateObj.getDay() === 0 ? 6 : dateObj.getDay() - 1
+  const startMin = toMinutes(time)
+  const endMin = startMin + durationMin
+
+  const [schedules, existingBookings, serviceDaysRows, variantDaysRows, daysOffRows, mastersRows, disabledVariantRows] = await Promise.all([
+    query('SELECT master_id, start_time, end_time FROM master_schedule WHERE master_id = ANY($1) AND day_of_week = $2 AND active = true', [masterIds, dow]),
+    query("SELECT master_id, time, duration_minutes FROM bookings WHERE master_id = ANY($1) AND date = $2 AND status != 'cancelled'", [masterIds, date]),
+    query('SELECT master_id, day_of_week FROM master_service_days WHERE master_id = ANY($1) AND service_id = $2', [masterIds, serviceId]),
+    variantId
+      ? query('SELECT master_id, day_of_week FROM master_variant_days WHERE master_id = ANY($1) AND variant_id = $2', [masterIds, variantId])
+      : Promise.resolve([]),
+    query('SELECT master_id FROM master_days_off WHERE master_id = ANY($1) AND date = $2', [masterIds, date]),
+    query('SELECT id, name FROM masters WHERE id = ANY($1)', [masterIds]),
+    variantId
+      ? query('SELECT master_id FROM master_disabled_variants WHERE master_id = ANY($1) AND variant_id = $2', [masterIds, variantId])
+      : Promise.resolve([]),
+  ])
+
+  const nameById = Object.fromEntries(mastersRows.map(m => [m.id, m.name]))
+  const disabledSet = new Set(disabledVariantRows.map(r => r.master_id))
+  const offSet = new Set(daysOffRows.map(r => r.master_id))
+  const serviceDayMap = {}
+  serviceDaysRows.forEach(r => { if (!serviceDayMap[r.master_id]) serviceDayMap[r.master_id] = new Set(); serviceDayMap[r.master_id].add(r.day_of_week) })
+  const variantDayMap = {}
+  variantDaysRows.forEach(r => { if (!variantDayMap[r.master_id]) variantDayMap[r.master_id] = new Set(); variantDayMap[r.master_id].add(r.day_of_week) })
+
+  for (const mid of masterIds) {
+    if (disabledSet.has(mid)) continue
+    if (offSet.has(mid)) continue
+    const svcDays = serviceDayMap[mid]
+    if (svcDays && svcDays.size > 0 && !svcDays.has(dow)) continue
+    const varDays = variantDayMap[mid]
+    if (varDays && varDays.size > 0 && !varDays.has(dow)) continue
+
+    const sched = schedules.find(s => s.master_id === mid)
+    if (!sched) continue
+    const schedStart = toMinutes(sched.start_time.slice(0, 5))
+    const schedEnd = toMinutes(sched.end_time.slice(0, 5))
+    if (startMin < schedStart || endMin > schedEnd) continue
+
+    const conflict = existingBookings.some(bk => {
+      if (bk.master_id !== mid) return false
+      const bs = toMinutes(bk.time.slice(0, 5))
+      const be = bs + (bk.duration_minutes ?? 60)
+      return startMin < be && endMin > bs
+    })
+    if (conflict) continue
+
+    return { id: mid, name: nameById[mid] ?? '' }
+  }
+  return null
+}
+
+app.post('/api/bookings', optionalAuth, asyncHandler(async (req, res) => {
   const b = req.body
+  // Only a logged-in admin may set an initial status other than "new" (e.g. manually
+  // adding an already-confirmed booking from the panel). Public website submissions always start as "new".
+  const status = req.adminUser && VALID_BOOKING_STATUSES.includes(b.status) ? b.status : 'new'
+
+  const validServiceId = isUuid(b.serviceId) ? b.serviceId : null
+  const validMasterId = isUuid(b.masterId) ? b.masterId : null
+
+  // Look up the real duration (and matching variant id) instead of trusting the client.
+  let variantId = null
+  let durationMin = 60
+  if (validServiceId) {
+    const svcRows = await query('SELECT duration_minutes FROM services WHERE id = $1', [validServiceId])
+    if (svcRows[0]) durationMin = svcRows[0].duration_minutes ?? 60
+    if (b.variantName) {
+      const varRows = await query('SELECT id, duration_minutes FROM service_variants WHERE service_id = $1 AND name = $2', [validServiceId, b.variantName])
+      if (varRows[0]) {
+        variantId = varRows[0].id
+        if (varRows[0].duration_minutes) durationMin = varRows[0].duration_minutes
+      }
+    }
+  }
+
+  // Assign (and validate) a real master, so "любой мастер" bookings always pin down
+  // someone who is actually free, and explicit picks can't silently double-book a slot.
+  let assignedMasterId = validMasterId
+  let assignedMasterName = validMasterId ? (b.master || '') : ''
+  if (validServiceId && b.date && b.time) {
+    const resolved = await resolveBookingMaster({
+      masterId: validMasterId,
+      serviceId: validServiceId,
+      variantId,
+      date: b.date,
+      time: b.time,
+      durationMin,
+    })
+    if (resolved === 'no_candidates') {
+      // No masters configured for this service at all — keep the legacy unassigned booking.
+    } else if (!resolved) {
+      return res.status(409).json({ error: 'Извините, на выбранное время уже нет свободных мастеров. Пожалуйста, выберите другое время.' })
+    } else {
+      assignedMasterId = resolved.id
+      assignedMasterName = resolved.name
+    }
+  }
+
   const rows = await query(
     `INSERT INTO bookings (service_id, service_name, variant_name, master_id, master_name, date, time, duration_minutes, client_name, client_phone, comment, status, source)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'new',$12) RETURNING *`,
-    [b.serviceId ?? null, b.service, b.variantName ?? '', b.masterId ?? null, b.master ?? '', b.date, b.time, 60, b.name, b.phone, b.comment ?? '', b.source ?? 'website'],
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+    [validServiceId, b.service, b.variantName ?? '', assignedMasterId, assignedMasterName, b.date, b.time, durationMin, b.name, b.phone, b.comment ?? '', status, b.source ?? 'website'],
   )
   res.json(rowToBooking(rows[0]))
 }))
@@ -537,6 +662,37 @@ app.post('/api/bookings', asyncHandler(async (req, res) => {
 app.patch('/api/bookings/:id/status', ...requirePermission('bookings'), asyncHandler(async (req, res) => {
   await query('UPDATE bookings SET status = $1 WHERE id = $2', [req.body.status, req.params.id])
   res.json({ ok: true })
+}))
+
+app.patch('/api/bookings/:id/master', ...requirePermission('bookings'), asyncHandler(async (req, res) => {
+  const { masterId } = req.body
+  if (masterId && !isUuid(masterId)) return res.status(400).json({ error: 'Некорректный мастер' })
+  const bookingRows = await query('SELECT date, time, duration_minutes FROM bookings WHERE id = $1', [req.params.id])
+  if (!bookingRows[0]) return res.status(404).json({ error: 'Запись не найдена' })
+  const { date, time, duration_minutes: durationMinutes } = bookingRows[0]
+
+  let masterName = ''
+  if (masterId) {
+    const masterRows = await query('SELECT name FROM masters WHERE id = $1', [masterId])
+    if (!masterRows[0]) return res.status(404).json({ error: 'Мастер не найден' })
+    masterName = masterRows[0].name
+
+    const startMin = toMinutes(time.slice(0, 5))
+    const endMin = startMin + (durationMinutes ?? 60)
+    const others = await query(
+      `SELECT time, duration_minutes FROM bookings WHERE master_id = $1 AND date = $2 AND id != $3 AND status != 'cancelled'`,
+      [masterId, date, req.params.id],
+    )
+    const conflict = others.some(b => {
+      const bs = toMinutes(b.time.slice(0, 5))
+      const be = bs + (b.duration_minutes ?? 60)
+      return startMin < be && endMin > bs
+    })
+    if (conflict) return res.status(409).json({ error: 'У этого мастера уже есть запись на это время.' })
+  }
+
+  await query('UPDATE bookings SET master_id = $1, master_name = $2 WHERE id = $3', [masterId || null, masterName, req.params.id])
+  res.json({ masterId: masterId || null, masterName })
 }))
 
 app.delete('/api/bookings/:id', ...requirePermission('bookings'), asyncHandler(async (req, res) => {
@@ -631,13 +787,19 @@ app.delete('/api/testimonials/:id', ...requirePermission('testimonials'), asyncH
 
 async function resolveMasterIds(masterId, serviceId) {
   if (masterId) return [masterId]
-  const rows = await query('SELECT master_id FROM master_services WHERE service_id = $1', [serviceId])
+  const rows = await query(
+    `SELECT ms.master_id FROM master_services ms
+     JOIN masters m ON m.id = ms.master_id
+     WHERE ms.service_id = $1 AND m.active = true`,
+    [serviceId],
+  )
   return rows.map(r => r.master_id)
 }
 
 app.get('/api/availability/days', asyncHandler(async (req, res) => {
   const { masterId, serviceId, variantId, year, month } = req.query
   const y = Number(year), mo = Number(month)
+  if (!isUuid(serviceId) || (masterId && !isUuid(masterId)) || (variantId && !isUuid(variantId))) return res.json([])
   const masterIds = await resolveMasterIds(masterId || null, serviceId)
   if (!masterIds.length) return res.json([])
 
@@ -696,21 +858,24 @@ app.get('/api/availability/days', asyncHandler(async (req, res) => {
 
 app.get('/api/availability/slots', asyncHandler(async (req, res) => {
   const { masterId, serviceId, variantId, date, durationMinutes } = req.query
+  if (!isUuid(serviceId) || (masterId && !isUuid(masterId)) || (variantId && !isUuid(variantId))) return res.json([])
   const durationMin = Number(durationMinutes) || 60
   const dateObj = new Date(date)
   const dow = dateObj.getDay() === 0 ? 6 : dateObj.getDay() - 1
   const masterIds = await resolveMasterIds(masterId || null, serviceId)
   if (!masterIds.length) return res.json([])
 
-  const [schedules, existingBookings, serviceDaysRows, variantDaysRows] = await Promise.all([
+  const [schedules, existingBookings, serviceDaysRows, variantDaysRows, daysOffRows] = await Promise.all([
     query('SELECT master_id, start_time, end_time FROM master_schedule WHERE master_id = ANY($1) AND day_of_week = $2 AND active = true', [masterIds, dow]),
     query("SELECT master_id, time, duration_minutes FROM bookings WHERE master_id = ANY($1) AND date = $2 AND status != 'cancelled'", [masterIds, date]),
     query('SELECT master_id, day_of_week FROM master_service_days WHERE master_id = ANY($1) AND service_id = $2', [masterIds, serviceId]),
     variantId
       ? query('SELECT master_id, day_of_week FROM master_variant_days WHERE master_id = ANY($1) AND variant_id = $2', [masterIds, variantId])
       : Promise.resolve([]),
+    query('SELECT master_id FROM master_days_off WHERE master_id = ANY($1) AND date = $2', [masterIds, date]),
   ])
 
+  const offSet = new Set(daysOffRows.map(r => r.master_id))
   const serviceDayMap = {}
   serviceDaysRows.forEach(r => {
     if (!serviceDayMap[r.master_id]) serviceDayMap[r.master_id] = new Set()
@@ -722,6 +887,7 @@ app.get('/api/availability/slots', asyncHandler(async (req, res) => {
     variantDayMap[r.master_id].add(r.day_of_week)
   })
   const filteredSchedules = schedules.filter(sched => {
+    if (offSet.has(sched.master_id)) return false
     const svcDays = serviceDayMap[sched.master_id]
     const serviceAllowed = !svcDays || svcDays.size === 0 || svcDays.has(dow)
     const varDays = variantDayMap[sched.master_id]

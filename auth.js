@@ -75,6 +75,19 @@ export function requireAuth(req, res, next) {
     .catch(next)
 }
 
+/** Like requireAuth, but never rejects — attaches req.adminUser only if a valid session token is present. */
+export function optionalAuth(req, res, next) {
+  const header = req.headers.authorization ?? ''
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null
+  if (!token) return next()
+  getSessionUser(token)
+    .then(user => {
+      if (user) { req.adminUser = user; req.adminToken = token }
+      next()
+    })
+    .catch(() => next())
+}
+
 /**
  * Returns middleware requiring the caller to be authenticated AND have at least
  * one of the given permissions (or be an 'owner', who bypasses all checks).
