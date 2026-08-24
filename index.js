@@ -265,12 +265,24 @@ function maskPhone(phone) {
 }
 
 function toMinutes(t) {
-  const [h, m] = t.split(':').map(Number)
+  const [h, m] = String(t).slice(0, 5).split(':').map(Number)
   return h * 60 + (m ?? 0)
 }
 function minutesToTime(m) {
   return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`
 }
+
+/** Existing appointment occupies [start, start + duration) — only forward from its start. */
+function bookingOccupiesSlot(slotMin, booking) {
+  const start = toMinutes(booking.time)
+  const end = start + (Number(booking.duration_minutes) || 60)
+  return slotMin >= start && slotMin < end
+}
+
+function startConflictsWithBookings(slotMin, bookings) {
+  return bookings.some(b => bookingOccupiesSlot(slotMin, b))
+}
+
 function asyncHandler(fn) {
   return (req, res, next) => fn(req, res, next).catch(next)
 }
@@ -613,13 +625,8 @@ async function resolveBookingMaster({ masterId, serviceId, variantId, date, time
     const schedEnd = toMinutes(sched.end_time.slice(0, 5))
     if (startMin < schedStart || endMin > schedEnd) continue
 
-    const conflict = existingBookings.some(bk => {
-      if (bk.master_id !== mid) return false
-      const bs = toMinutes(bk.time.slice(0, 5))
-      const be = bs + (bk.duration_minutes ?? 60)
-      return startMin < be && endMin > bs
-    })
-    if (conflict) continue
+    const masterBookings = existingBookings.filter(bk => bk.master_id === mid)
+    if (startConflictsWithBookings(startMin, masterBookings)) continue
 
     return { id: mid, name: nameById[mid] ?? '' }
   }
@@ -691,7 +698,7 @@ app.patch('/api/bookings/:id/master', ...requirePermission('bookings'), asyncHan
   if (masterId && !isUuid(masterId)) return res.status(400).json({ error: 'Некорректный мастер' })
   const bookingRows = await query('SELECT date, time, duration_minutes FROM bookings WHERE id = $1', [req.params.id])
   if (!bookingRows[0]) return res.status(404).json({ error: 'Запись не найдена' })
-  const { date, time, duration_minutes: durationMinutes } = bookingRows[0]
+  const { date, time } = bookingRows[0]
 
   let masterName = ''
   if (masterId) {
@@ -700,17 +707,13 @@ app.patch('/api/bookings/:id/master', ...requirePermission('bookings'), asyncHan
     masterName = masterRows[0].name
 
     const startMin = toMinutes(time.slice(0, 5))
-    const endMin = startMin + (durationMinutes ?? 60)
     const others = await query(
       `SELECT time, duration_minutes FROM bookings WHERE master_id = $1 AND date = $2 AND id != $3 AND status != 'cancelled'`,
       [masterId, date, req.params.id],
     )
-    const conflict = others.some(b => {
-      const bs = toMinutes(b.time.slice(0, 5))
-      const be = bs + (b.duration_minutes ?? 60)
-      return startMin < be && endMin > bs
-    })
-    if (conflict) return res.status(409).json({ error: 'У этого мастера уже есть запись на это время.' })
+    if (startConflictsWithBookings(startMin, others)) {
+      return res.status(409).json({ error: 'У этого мастера уже есть запись на это время.' })
+    }
   }
 
   await query('UPDATE bookings SET master_id = $1, master_name = $2 WHERE id = $3', [masterId || null, masterName, req.params.id])
@@ -954,11 +957,7 @@ app.get('/api/availability/slots', asyncHandler(async (req, res) => {
     for (let t = startMin; t + durationMin <= endMin; t += 30) {
       const slotKey = minutesToTime(t)
       if (slotMap[slotKey] === true) continue
-      const blocked = masterBookings.some(b => {
-        const bs = toMinutes(b.time.slice(0, 5))
-        const be = bs + (b.duration_minutes ?? 60)
-        return t < be && t + durationMin > bs
-      })
+      const blocked = startConflictsWithBookings(t, masterBookings)
       if (!blocked) slotMap[slotKey] = true
       else if (slotMap[slotKey] === undefined) slotMap[slotKey] = false
     }
