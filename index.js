@@ -329,6 +329,32 @@ function weekdayAllowed(days, dow) {
   return !days || days.size === 0 || days.has(dow)
 }
 
+function phoneDigits(phone) {
+  let d = String(phone ?? '').replace(/\D/g, '')
+  if (d.length === 11 && d[0] === '8') d = '7' + d.slice(1)
+  if (d.length === 10) d = '7' + d
+  return d
+}
+
+let clientProfilesReady = false
+async function ensureClientProfiles() {
+  if (clientProfilesReady) return
+  await query(`
+    CREATE TABLE IF NOT EXISTS client_profiles (
+      phone_digits TEXT PRIMARY KEY,
+      notes TEXT NOT NULL DEFAULT '',
+      birthday DATE,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`)
+  await query(`ALTER TABLE client_profiles ADD COLUMN IF NOT EXISTS birthday DATE`)
+  clientProfilesReady = true
+}
+
+function isoDateOnly(value) {
+  const s = String(value ?? '').trim().slice(0, 10)
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ''
+}
+
 function normalizeIntervals(raw) {
   const list = []
   for (const iv of raw) {
@@ -918,6 +944,68 @@ app.patch('/api/bookings/:id/master', ...requirePermission('bookings'), asyncHan
 app.delete('/api/bookings/:id', ...requirePermission('bookings'), asyncHandler(async (req, res) => {
   await query('DELETE FROM bookings WHERE id = $1', [req.params.id])
   res.status(204).end()
+}))
+
+// ─── CLIENT DIRECTORY ────────────────────────────────────────────────────────
+
+app.get('/api/clients', ...requirePermission('bookings'), asyncHandler(async (req, res) => {
+  await ensureClientProfiles()
+  const [bookings, profiles] = await Promise.all([
+    query('SELECT client_name, client_phone, date, time, master_name FROM bookings'),
+    query('SELECT phone_digits, notes, birthday::text AS birthday FROM client_profiles'),
+  ])
+  const profileByPhone = Object.fromEntries(profiles.map(p => [p.phone_digits, p]))
+  const byKey = {}
+  for (const r of bookings) {
+    const digits = phoneDigits(r.client_phone)
+    const key = digits || `name:${String(r.client_name).trim().toLowerCase()}`
+    const stamp = `${String(r.date).slice(0, 10)}T${String(r.time).slice(0, 5)}`
+    const prev = byKey[key]
+    if (!prev || stamp > prev.lastStamp) {
+      const profile = profileByPhone[digits] || {}
+      byKey[key] = {
+        phoneDigits: digits,
+        name: String(r.client_name ?? '').trim(),
+        phone: String(r.client_phone ?? '').trim(),
+        lastDate: String(r.date).slice(0, 10),
+        lastTime: String(r.time).slice(0, 5),
+        lastStamp: stamp,
+        master: r.master_name || '',
+        notes: profile.notes ?? '',
+        birthday: isoDateOnly(profile.birthday),
+      }
+    }
+  }
+  const list = Object.values(byKey)
+    .map(({ lastStamp, ...rest }) => rest)
+    .sort((a, b) => a.name.localeCompare(b.name, 'ru', { sensitivity: 'base' }))
+  res.json(list)
+}))
+
+app.put('/api/clients/notes', ...requirePermission('bookings'), asyncHandler(async (req, res) => {
+  await ensureClientProfiles()
+  const digits = phoneDigits(req.body.phoneDigits ?? req.body.phone)
+  if (!digits) return res.status(400).json({ error: 'Нужен телефон клиента' })
+  const notes = String(req.body.notes ?? '')
+  await query(
+    `INSERT INTO client_profiles (phone_digits, notes, updated_at) VALUES ($1,$2,now())
+     ON CONFLICT (phone_digits) DO UPDATE SET notes = $2, updated_at = now()`,
+    [digits, notes],
+  )
+  res.json({ ok: true, phoneDigits: digits, notes })
+}))
+
+app.put('/api/clients/birthday', ...requirePermission('bookings'), asyncHandler(async (req, res) => {
+  await ensureClientProfiles()
+  const digits = phoneDigits(req.body.phoneDigits ?? req.body.phone)
+  if (!digits) return res.status(400).json({ error: 'Нужен телефон клиента' })
+  const birthday = isoDateOnly(req.body.birthday) || null
+  await query(
+    `INSERT INTO client_profiles (phone_digits, notes, birthday, updated_at) VALUES ($1,'',$2,now())
+     ON CONFLICT (phone_digits) DO UPDATE SET birthday = $2, updated_at = now()`,
+    [digits, birthday],
+  )
+  res.json({ ok: true, phoneDigits: digits, birthday: birthday ?? '' })
 }))
 
 // ─── MASTER PERSONAL CABINET (self-service, scoped to the caller's own master_id) ──
