@@ -283,6 +283,157 @@ function startConflictsWithBookings(slotMin, bookings) {
   return bookings.some(b => bookingOccupiesSlot(slotMin, b))
 }
 
+function pad2(n) {
+  return String(n).padStart(2, '0')
+}
+
+function monthBounds(year, month0) {
+  const last = new Date(year, month0 + 1, 0).getDate()
+  return {
+    start: `${year}-${pad2(month0 + 1)}-01`,
+    end: `${year}-${pad2(month0 + 1)}-${pad2(last)}`,
+    last,
+  }
+}
+
+function dateDow(dateStr) {
+  const [y, m, d] = String(dateStr).slice(0, 10).split('-').map(Number)
+  const js = new Date(y, m - 1, d).getDay()
+  return js === 0 ? 6 : js - 1
+}
+
+function groupWorkDays(rows) {
+  const map = {}
+  for (const r of rows) {
+    const date = r.date
+    if (!map[date]) map[date] = []
+    map[date].push({
+      startTime: String(r.start_time).slice(0, 5),
+      endTime: String(r.end_time).slice(0, 5),
+    })
+  }
+  return Object.entries(map)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, intervals]) => ({ date, intervals }))
+}
+
+function fitsInIntervals(startMin, endMin, intervals) {
+  return intervals.some(iv => {
+    const a = toMinutes(iv.start_time ?? iv.startTime)
+    const b = toMinutes(iv.end_time ?? iv.endTime)
+    return startMin >= a && endMin <= b
+  })
+}
+
+function weekdayAllowed(days, dow) {
+  return !days || days.size === 0 || days.has(dow)
+}
+
+function normalizeIntervals(raw) {
+  const list = []
+  for (const iv of raw) {
+    const startTime = String(iv.startTime ?? iv.start_time ?? '').slice(0, 5)
+    const endTime = String(iv.endTime ?? iv.end_time ?? '').slice(0, 5)
+    if (!startTime || !endTime || toMinutes(endTime) <= toMinutes(startTime)) continue
+    list.push({ startTime, endTime })
+  }
+  list.sort((a, b) => toMinutes(a.startTime) - toMinutes(b.startTime))
+  for (let i = 1; i < list.length; i++) {
+    if (toMinutes(list[i].startTime) < toMinutes(list[i - 1].endTime)) return null
+  }
+  return list
+}
+
+let workTablesReady = false
+async function ensureWorkTables() {
+  if (workTablesReady) return
+  await query(`
+    CREATE TABLE IF NOT EXISTS master_work_intervals (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      master_id UUID NOT NULL REFERENCES masters(id) ON DELETE CASCADE,
+      date DATE NOT NULL,
+      start_time TIME NOT NULL,
+      end_time TIME NOT NULL,
+      sort_order INTEGER NOT NULL DEFAULT 0
+    )`)
+  await query(`CREATE INDEX IF NOT EXISTS idx_master_work_intervals_master_date
+    ON master_work_intervals (master_id, date)`)
+  await query(`
+    CREATE TABLE IF NOT EXISTS master_work_months (
+      master_id UUID NOT NULL REFERENCES masters(id) ON DELETE CASCADE,
+      year INTEGER NOT NULL,
+      month INTEGER NOT NULL,
+      PRIMARY KEY (master_id, year, month)
+    )`)
+  workTablesReady = true
+}
+
+async function markWorkMonth(masterId, year, month0) {
+  await query(
+    `INSERT INTO master_work_months (master_id, year, month) VALUES ($1,$2,$3)
+     ON CONFLICT (master_id, year, month) DO NOTHING`,
+    [masterId, year, month0],
+  )
+}
+
+async function seedMonthFromWeekly(masterId, year, month0) {
+  await ensureWorkTables()
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const marked = await client.query(
+      `INSERT INTO master_work_months (master_id, year, month) VALUES ($1,$2,$3)
+       ON CONFLICT (master_id, year, month) DO NOTHING RETURNING 1`,
+      [masterId, year, month0],
+    )
+    if (!marked.rowCount) {
+      await client.query('COMMIT')
+      return
+    }
+
+    const { start, end, last } = monthBounds(year, month0)
+    const weekly = await client.query(
+      'SELECT day_of_week, start_time, end_time FROM master_schedule WHERE master_id = $1 AND active = true',
+      [masterId],
+    )
+    const offs = await client.query(
+      'SELECT date FROM master_days_off WHERE master_id = $1 AND date >= $2 AND date <= $3',
+      [masterId, start, end],
+    )
+    const offSet = new Set(offs.rows.map(d => d.date))
+    const byDow = Object.fromEntries(weekly.rows.map(s => [s.day_of_week, s]))
+
+    for (let d = 1; d <= last; d++) {
+      const dateStr = `${year}-${pad2(month0 + 1)}-${pad2(d)}`
+      if (offSet.has(dateStr)) continue
+      const tmpl = byDow[dateDow(dateStr)]
+      if (!tmpl) continue
+      await client.query(
+        `INSERT INTO master_work_intervals (master_id, date, start_time, end_time, sort_order)
+         VALUES ($1,$2,$3,$4,0)`,
+        [masterId, dateStr, tmpl.start_time, tmpl.end_time],
+      )
+    }
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK')
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
+async function loadWorkIntervals(masterIds, date) {
+  if (!masterIds.length) return []
+  await ensureWorkTables()
+  const [y, m] = String(date).slice(0, 7).split('-').map(Number)
+  for (const mid of masterIds) await seedMonthFromWeekly(mid, y, m - 1)
+  return query(
+    'SELECT master_id, date, start_time, end_time FROM master_work_intervals WHERE master_id = ANY($1) AND date = $2 ORDER BY sort_order, start_time',
+    [masterIds, date],
+  )
+}
+
 function asyncHandler(fn) {
   return (req, res, next) => fn(req, res, next).catch(next)
 }
@@ -464,6 +615,48 @@ app.put('/api/masters/:id/schedule', ...requirePermission('schedule'), asyncHand
   res.json({ ok: true })
 }))
 
+app.get('/api/masters/:id/work-days', ...requirePermission('schedule'), asyncHandler(async (req, res) => {
+  const id = req.params.id
+  const year = Number(req.query.year)
+  const month0 = Number(req.query.month)
+  if (!Number.isInteger(year) || !Number.isInteger(month0) || month0 < 0 || month0 > 11) {
+    return res.status(400).json({ error: 'Нужны year и month' })
+  }
+  await seedMonthFromWeekly(id, year, month0)
+  const { start, end } = monthBounds(year, month0)
+  const rows = await query(
+    `SELECT date, start_time, end_time FROM master_work_intervals
+     WHERE master_id = $1 AND date >= $2 AND date <= $3
+     ORDER BY date, sort_order, start_time`,
+    [id, start, end],
+  )
+  res.json(groupWorkDays(rows))
+}))
+
+app.put('/api/masters/:id/work-days/:date', ...requirePermission('schedule'), asyncHandler(async (req, res) => {
+  const { id, date } = req.params
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'Некорректная дата' })
+  const intervals = normalizeIntervals(Array.isArray(req.body.intervals) ? req.body.intervals : [])
+  if (intervals === null) return res.status(400).json({ error: 'Интервалы пересекаются' })
+  await ensureWorkTables()
+  const [y, m] = date.split('-').map(Number)
+  await markWorkMonth(id, y, m - 1)
+  await query('DELETE FROM master_work_intervals WHERE master_id = $1 AND date = $2', [id, date])
+  let order = 0
+  for (const iv of intervals) {
+    await query(
+      `INSERT INTO master_work_intervals (master_id, date, start_time, end_time, sort_order)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [id, date, iv.startTime, iv.endTime, order++],
+    )
+  }
+  const rows = await query(
+    `SELECT date, start_time, end_time FROM master_work_intervals WHERE master_id = $1 AND date = $2 ORDER BY sort_order, start_time`,
+    [id, date],
+  )
+  res.json(groupWorkDays(rows)[0] ?? { date, intervals: [] })
+}))
+
 // ─── DAYS OFF ────────────────────────────────────────────────────────────────
 
 app.get('/api/masters/:id/days-off', ...requirePermission('schedule'), asyncHandler(async (req, res) => {
@@ -584,19 +777,17 @@ async function resolveBookingMaster({ masterId, serviceId, variantId, date, time
       )).map(r => r.master_id)
   if (!masterIds.length) return 'no_candidates'
 
-  const dateObj = new Date(date)
-  const dow = dateObj.getDay() === 0 ? 6 : dateObj.getDay() - 1
   const startMin = toMinutes(time)
   const endMin = startMin + durationMin
+  const dow = dateDow(date)
 
-  const [schedules, existingBookings, serviceDaysRows, variantDaysRows, daysOffRows, mastersRows, disabledVariantRows] = await Promise.all([
-    query('SELECT master_id, start_time, end_time FROM master_schedule WHERE master_id = ANY($1) AND day_of_week = $2 AND active = true', [masterIds, dow]),
+  const [workRows, existingBookings, serviceDaysRows, variantDaysRows, mastersRows, disabledVariantRows] = await Promise.all([
+    loadWorkIntervals(masterIds, date),
     query("SELECT master_id, time, duration_minutes FROM bookings WHERE master_id = ANY($1) AND date = $2 AND status != 'cancelled'", [masterIds, date]),
     query('SELECT master_id, day_of_week FROM master_service_days WHERE master_id = ANY($1) AND service_id = $2', [masterIds, serviceId]),
     variantId
       ? query('SELECT master_id, day_of_week FROM master_variant_days WHERE master_id = ANY($1) AND variant_id = $2', [masterIds, variantId])
       : Promise.resolve([]),
-    query('SELECT master_id FROM master_days_off WHERE master_id = ANY($1) AND date = $2', [masterIds, date]),
     query('SELECT id, name FROM masters WHERE id = ANY($1)', [masterIds]),
     variantId
       ? query('SELECT master_id FROM master_disabled_variants WHERE master_id = ANY($1) AND variant_id = $2', [masterIds, variantId])
@@ -605,25 +796,29 @@ async function resolveBookingMaster({ masterId, serviceId, variantId, date, time
 
   const nameById = Object.fromEntries(mastersRows.map(m => [m.id, m.name]))
   const disabledSet = new Set(disabledVariantRows.map(r => r.master_id))
-  const offSet = new Set(daysOffRows.map(r => r.master_id))
+  const intervalsByMaster = {}
+  workRows.forEach(r => {
+    if (!intervalsByMaster[r.master_id]) intervalsByMaster[r.master_id] = []
+    intervalsByMaster[r.master_id].push(r)
+  })
   const serviceDayMap = {}
-  serviceDaysRows.forEach(r => { if (!serviceDayMap[r.master_id]) serviceDayMap[r.master_id] = new Set(); serviceDayMap[r.master_id].add(r.day_of_week) })
+  serviceDaysRows.forEach(r => {
+    if (!serviceDayMap[r.master_id]) serviceDayMap[r.master_id] = new Set()
+    serviceDayMap[r.master_id].add(r.day_of_week)
+  })
   const variantDayMap = {}
-  variantDaysRows.forEach(r => { if (!variantDayMap[r.master_id]) variantDayMap[r.master_id] = new Set(); variantDayMap[r.master_id].add(r.day_of_week) })
+  variantDaysRows.forEach(r => {
+    if (!variantDayMap[r.master_id]) variantDayMap[r.master_id] = new Set()
+    variantDayMap[r.master_id].add(r.day_of_week)
+  })
 
   for (const mid of masterIds) {
     if (disabledSet.has(mid)) continue
-    if (offSet.has(mid)) continue
-    const svcDays = serviceDayMap[mid]
-    if (svcDays && svcDays.size > 0 && !svcDays.has(dow)) continue
-    const varDays = variantDayMap[mid]
-    if (varDays && varDays.size > 0 && !varDays.has(dow)) continue
+    if (!weekdayAllowed(serviceDayMap[mid], dow)) continue
+    if (!weekdayAllowed(variantDayMap[mid], dow)) continue
 
-    const sched = schedules.find(s => s.master_id === mid)
-    if (!sched) continue
-    const schedStart = toMinutes(sched.start_time.slice(0, 5))
-    const schedEnd = toMinutes(sched.end_time.slice(0, 5))
-    if (startMin < schedStart || endMin > schedEnd) continue
+    const intervals = intervalsByMaster[mid] ?? []
+    if (!fitsInIntervals(startMin, endMin, intervals)) continue
 
     const masterBookings = existingBookings.filter(bk => bk.master_id === mid)
     if (startConflictsWithBookings(startMin, masterBookings)) continue
@@ -733,6 +928,24 @@ app.get('/api/my/bookings', ...requireMaster, asyncHandler(async (req, res) => {
     [req.adminUser.master_id],
   )
   res.json(rows.map(r => ({ ...rowToBooking(r), phone: maskPhone(r.client_phone) })))
+}))
+
+app.get('/api/my/work-days', ...requireMaster, asyncHandler(async (req, res) => {
+  const id = req.adminUser.master_id
+  const year = Number(req.query.year)
+  const month0 = Number(req.query.month)
+  if (!Number.isInteger(year) || !Number.isInteger(month0) || month0 < 0 || month0 > 11) {
+    return res.status(400).json({ error: 'Нужны year и month' })
+  }
+  await seedMonthFromWeekly(id, year, month0)
+  const { start, end } = monthBounds(year, month0)
+  const rows = await query(
+    `SELECT date, start_time, end_time FROM master_work_intervals
+     WHERE master_id = $1 AND date >= $2 AND date <= $3
+     ORDER BY date, sort_order, start_time`,
+    [id, start, end],
+  )
+  res.json(groupWorkDays(rows))
 }))
 
 app.get('/api/my/schedule', ...requireMaster, asyncHandler(async (req, res) => {
@@ -856,18 +1069,27 @@ app.get('/api/availability/days', asyncHandler(async (req, res) => {
   const masterIds = await resolveMasterIds(masterId || null, serviceId)
   if (!masterIds.length) return res.json([])
 
-  const startDate = `${y}-${String(mo + 1).padStart(2, '0')}-01`
-  const endDate = `${y}-${String(mo + 1).padStart(2, '0')}-31`
+  await ensureWorkTables()
+  for (const mid of masterIds) await seedMonthFromWeekly(mid, y, mo)
+  const { start, end } = monthBounds(y, mo)
 
-  const [schedules, daysOff, serviceDaysRows, variantDaysRows] = await Promise.all([
-    query('SELECT master_id, day_of_week FROM master_schedule WHERE master_id = ANY($1) AND active = true', [masterIds]),
-    query('SELECT master_id, date FROM master_days_off WHERE master_id = ANY($1) AND date >= $2 AND date <= $3', [masterIds, startDate, endDate]),
+  const [workRows, serviceDaysRows, variantDaysRows] = await Promise.all([
+    query(
+      `SELECT master_id, date FROM master_work_intervals
+       WHERE master_id = ANY($1) AND date >= $2 AND date <= $3`,
+      [masterIds, start, end],
+    ),
     query('SELECT master_id, day_of_week FROM master_service_days WHERE master_id = ANY($1) AND service_id = $2', [masterIds, serviceId]),
     variantId
       ? query('SELECT master_id, day_of_week FROM master_variant_days WHERE master_id = ANY($1) AND variant_id = $2', [masterIds, variantId])
       : Promise.resolve([]),
   ])
 
+  const workDates = {}
+  workRows.forEach(r => {
+    if (!workDates[r.master_id]) workDates[r.master_id] = new Set()
+    workDates[r.master_id].add(r.date)
+  })
   const serviceDayMap = {}
   serviceDaysRows.forEach(r => {
     if (!serviceDayMap[r.master_id]) serviceDayMap[r.master_id] = new Set()
@@ -877,12 +1099,6 @@ app.get('/api/availability/days', asyncHandler(async (req, res) => {
   variantDaysRows.forEach(r => {
     if (!variantDayMap[r.master_id]) variantDayMap[r.master_id] = new Set()
     variantDayMap[r.master_id].add(r.day_of_week)
-  })
-  const offMap = {}
-  daysOff.forEach(d => {
-    const key = d.master_id
-    if (!offMap[key]) offMap[key] = new Set()
-    offMap[key].add(d.date)
   })
 
   const today = new Date(); today.setHours(0, 0, 0, 0)
@@ -893,16 +1109,13 @@ app.get('/api/availability/days', asyncHandler(async (req, res) => {
     const date = new Date(y, mo, d)
     if (date < today) continue
     const dow = date.getDay() === 0 ? 6 : date.getDay() - 1
-    const dateStr = `${y}-${String(mo + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+    const dateStr = `${y}-${pad2(mo + 1)}-${pad2(d)}`
 
     const anyAvail = masterIds.some(mid => {
-      const works = schedules.some(s => s.master_id === mid && s.day_of_week === dow)
-      const isOff = offMap[mid]?.has(dateStr) ?? false
-      const svcDays = serviceDayMap[mid]
-      const serviceAllowed = !svcDays || svcDays.size === 0 || svcDays.has(dow)
-      const varDays = variantDayMap[mid]
-      const variantAllowed = !varDays || varDays.size === 0 || varDays.has(dow)
-      return works && !isOff && serviceAllowed && variantAllowed
+      if (!(workDates[mid]?.has(dateStr))) return false
+      if (!weekdayAllowed(serviceDayMap[mid], dow)) return false
+      if (!weekdayAllowed(variantDayMap[mid], dow)) return false
+      return true
     })
     if (anyAvail) result.push(d)
   }
@@ -913,22 +1126,22 @@ app.get('/api/availability/slots', asyncHandler(async (req, res) => {
   const { masterId, serviceId, variantId, date, durationMinutes } = req.query
   if (!isUuid(serviceId) || (masterId && !isUuid(masterId)) || (variantId && !isUuid(variantId))) return res.json([])
   const durationMin = Number(durationMinutes) || 60
-  const dateObj = new Date(date)
-  const dow = dateObj.getDay() === 0 ? 6 : dateObj.getDay() - 1
   const masterIds = await resolveMasterIds(masterId || null, serviceId)
   if (!masterIds.length) return res.json([])
+  const dow = dateDow(date)
 
-  const [schedules, existingBookings, serviceDaysRows, variantDaysRows, daysOffRows] = await Promise.all([
-    query('SELECT master_id, start_time, end_time FROM master_schedule WHERE master_id = ANY($1) AND day_of_week = $2 AND active = true', [masterIds, dow]),
+  const [workRows, existingBookings, serviceDaysRows, variantDaysRows, disabledVariantRows] = await Promise.all([
+    loadWorkIntervals(masterIds, date),
     query("SELECT master_id, time, duration_minutes FROM bookings WHERE master_id = ANY($1) AND date = $2 AND status != 'cancelled'", [masterIds, date]),
     query('SELECT master_id, day_of_week FROM master_service_days WHERE master_id = ANY($1) AND service_id = $2', [masterIds, serviceId]),
     variantId
       ? query('SELECT master_id, day_of_week FROM master_variant_days WHERE master_id = ANY($1) AND variant_id = $2', [masterIds, variantId])
       : Promise.resolve([]),
-    query('SELECT master_id FROM master_days_off WHERE master_id = ANY($1) AND date = $2', [masterIds, date]),
+    variantId
+      ? query('SELECT master_id FROM master_disabled_variants WHERE master_id = ANY($1) AND variant_id = $2', [masterIds, variantId])
+      : Promise.resolve([]),
   ])
 
-  const offSet = new Set(daysOffRows.map(r => r.master_id))
   const serviceDayMap = {}
   serviceDaysRows.forEach(r => {
     if (!serviceDayMap[r.master_id]) serviceDayMap[r.master_id] = new Set()
@@ -939,27 +1152,28 @@ app.get('/api/availability/slots', asyncHandler(async (req, res) => {
     if (!variantDayMap[r.master_id]) variantDayMap[r.master_id] = new Set()
     variantDayMap[r.master_id].add(r.day_of_week)
   })
-  const filteredSchedules = schedules.filter(sched => {
-    if (offSet.has(sched.master_id)) return false
-    const svcDays = serviceDayMap[sched.master_id]
-    const serviceAllowed = !svcDays || svcDays.size === 0 || svcDays.has(dow)
-    const varDays = variantDayMap[sched.master_id]
-    const variantAllowed = !varDays || varDays.size === 0 || varDays.has(dow)
-    return serviceAllowed && variantAllowed
+  const disabledSet = new Set(disabledVariantRows.map(r => r.master_id))
+  const allowedMasters = masterIds.filter(mid => {
+    if (disabledSet.has(mid)) return false
+    if (!weekdayAllowed(serviceDayMap[mid], dow)) return false
+    if (!weekdayAllowed(variantDayMap[mid], dow)) return false
+    return true
   })
 
   const slotMap = {}
-  for (const sched of filteredSchedules) {
-    const startMin = toMinutes(sched.start_time.slice(0, 5))
-    const endMin = toMinutes(sched.end_time.slice(0, 5))
-    const masterBookings = existingBookings.filter(b => b.master_id === sched.master_id)
-
-    for (let t = startMin; t + durationMin <= endMin; t += 30) {
-      const slotKey = minutesToTime(t)
-      if (slotMap[slotKey] === true) continue
-      const blocked = startConflictsWithBookings(t, masterBookings)
-      if (!blocked) slotMap[slotKey] = true
-      else if (slotMap[slotKey] === undefined) slotMap[slotKey] = false
+  for (const mid of allowedMasters) {
+    const intervals = workRows.filter(r => r.master_id === mid)
+    const masterBookings = existingBookings.filter(b => b.master_id === mid)
+    for (const iv of intervals) {
+      const startMin = toMinutes(iv.start_time)
+      const endMin = toMinutes(iv.end_time)
+      for (let t = startMin; t + durationMin <= endMin; t += 30) {
+        const slotKey = minutesToTime(t)
+        if (slotMap[slotKey] === true) continue
+        const blocked = startConflictsWithBookings(t, masterBookings)
+        if (!blocked) slotMap[slotKey] = true
+        else if (slotMap[slotKey] === undefined) slotMap[slotKey] = false
+      }
     }
   }
 
