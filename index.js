@@ -792,7 +792,7 @@ const VALID_BOOKING_STATUSES = ['new', 'confirmed', 'done', 'cancelled']
  *   - 'no_candidates' if the service has no masters configured at all (legacy/unassigned booking allowed)
  *   - null if masters exist for the service but none of them is free for this exact slot
  */
-async function resolveBookingMaster({ masterId, serviceId, variantId, date, time, durationMin }) {
+async function resolveBookingMaster({ masterId, serviceId, variantId, date, time, durationMin, excludeBookingId }) {
   const masterIds = masterId
     ? [masterId]
     : (await query(
@@ -806,10 +806,16 @@ async function resolveBookingMaster({ masterId, serviceId, variantId, date, time
   const startMin = toMinutes(time)
   const endMin = startMin + durationMin
   const dow = dateDow(date)
+  const excludeId = isUuid(excludeBookingId) ? excludeBookingId : null
 
   const [workRows, existingBookings, serviceDaysRows, variantDaysRows, mastersRows, disabledVariantRows] = await Promise.all([
     loadWorkIntervals(masterIds, date),
-    query("SELECT master_id, time, duration_minutes FROM bookings WHERE master_id = ANY($1) AND date = $2 AND status != 'cancelled'", [masterIds, date]),
+    query(
+      `SELECT master_id, time, duration_minutes FROM bookings
+       WHERE master_id = ANY($1) AND date = $2 AND status != 'cancelled'
+         AND ($3::uuid IS NULL OR id != $3)`,
+      [masterIds, date, excludeId],
+    ),
     query('SELECT master_id, day_of_week FROM master_service_days WHERE master_id = ANY($1) AND service_id = $2', [masterIds, serviceId]),
     variantId
       ? query('SELECT master_id, day_of_week FROM master_variant_days WHERE master_id = ANY($1) AND variant_id = $2', [masterIds, variantId])
@@ -905,6 +911,67 @@ app.post('/api/bookings', optionalAuth, asyncHandler(async (req, res) => {
     `INSERT INTO bookings (service_id, service_name, variant_name, master_id, master_name, date, time, duration_minutes, client_name, client_phone, comment, status, source)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
     [validServiceId, b.service, b.variantName ?? '', assignedMasterId, assignedMasterName, b.date, b.time, durationMin, b.name, b.phone, b.comment ?? '', status, b.source ?? 'website'],
+  )
+  res.json(rowToBooking(rows[0]))
+}))
+
+app.put('/api/bookings/:id', ...requirePermission('bookings'), asyncHandler(async (req, res) => {
+  const b = req.body
+  const id = req.params.id
+  const existing = await query('SELECT * FROM bookings WHERE id = $1', [id])
+  if (!existing[0]) return res.status(404).json({ error: 'Запись не найдена' })
+
+  const validServiceId = isUuid(b.serviceId) ? b.serviceId : null
+  const validMasterId = isUuid(b.masterId) ? b.masterId : null
+  if (!validServiceId || !b.date || !b.time || !String(b.name ?? '').trim()) {
+    return res.status(400).json({ error: 'Нужны услуга, имя, дата и время' })
+  }
+
+  let variantId = null
+  let durationMin = 60
+  const svcRows = await query('SELECT duration_minutes FROM services WHERE id = $1', [validServiceId])
+  if (svcRows[0]) durationMin = svcRows[0].duration_minutes ?? 60
+  if (b.variantName) {
+    const varRows = await query('SELECT id, duration_minutes FROM service_variants WHERE service_id = $1 AND name = $2', [validServiceId, b.variantName])
+    if (varRows[0]) {
+      variantId = varRows[0].id
+      if (varRows[0].duration_minutes) durationMin = varRows[0].duration_minutes
+    }
+  }
+
+  let assignedMasterId = validMasterId
+  let assignedMasterName = validMasterId ? (b.master || '') : ''
+  const resolved = await resolveBookingMaster({
+    masterId: validMasterId,
+    serviceId: validServiceId,
+    variantId,
+    date: b.date,
+    time: b.time,
+    durationMin,
+    excludeBookingId: id,
+  })
+  if (resolved === 'no_candidates') {
+    // keep explicit master or leave unassigned
+  } else if (!resolved) {
+    return res.status(409).json({ error: 'На это время мастер уже занят. Выберите другое время.' })
+  } else {
+    assignedMasterId = resolved.id
+    assignedMasterName = resolved.name
+  }
+
+  const status = VALID_BOOKING_STATUSES.includes(b.status) ? b.status : existing[0].status
+  const rows = await query(
+    `UPDATE bookings SET
+       service_id = $1, service_name = $2, variant_name = $3,
+       master_id = $4, master_name = $5, date = $6, time = $7, duration_minutes = $8,
+       client_name = $9, client_phone = $10, comment = $11, status = $12, source = $13
+     WHERE id = $14 RETURNING *`,
+    [
+      validServiceId, b.service, b.variantName ?? '',
+      assignedMasterId, assignedMasterName, b.date, b.time, durationMin,
+      String(b.name ?? '').trim(), String(b.phone ?? ''), b.comment ?? '',
+      status, b.source ?? existing[0].source ?? 'admin', id,
+    ],
   )
   res.json(rowToBooking(rows[0]))
 }))
@@ -1211,16 +1278,22 @@ app.get('/api/availability/days', asyncHandler(async (req, res) => {
 }))
 
 app.get('/api/availability/slots', asyncHandler(async (req, res) => {
-  const { masterId, serviceId, variantId, date, durationMinutes } = req.query
+  const { masterId, serviceId, variantId, date, durationMinutes, excludeBookingId } = req.query
   if (!isUuid(serviceId) || (masterId && !isUuid(masterId)) || (variantId && !isUuid(variantId))) return res.json([])
   const durationMin = Number(durationMinutes) || 60
   const masterIds = await resolveMasterIds(masterId || null, serviceId)
   if (!masterIds.length) return res.json([])
   const dow = dateDow(date)
+  const excludeId = isUuid(excludeBookingId) ? excludeBookingId : null
 
   const [workRows, existingBookings, serviceDaysRows, variantDaysRows, disabledVariantRows] = await Promise.all([
     loadWorkIntervals(masterIds, date),
-    query("SELECT master_id, time, duration_minutes FROM bookings WHERE master_id = ANY($1) AND date = $2 AND status != 'cancelled'", [masterIds, date]),
+    query(
+      `SELECT master_id, time, duration_minutes FROM bookings
+       WHERE master_id = ANY($1) AND date = $2 AND status != 'cancelled'
+         AND ($3::uuid IS NULL OR id != $3)`,
+      [masterIds, date, excludeId],
+    ),
     query('SELECT master_id, day_of_week FROM master_service_days WHERE master_id = ANY($1) AND service_id = $2', [masterIds, serviceId]),
     variantId
       ? query('SELECT master_id, day_of_week FROM master_variant_days WHERE master_id = ANY($1) AND variant_id = $2', [masterIds, variantId])
